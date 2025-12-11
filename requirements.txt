@@ -1,5 +1,6 @@
 streamlit
 opencv-python-headless
-pytesseract
-Pillow
 numpy
+Pillow
+easyocr
+streamlit-drawable-canvas
