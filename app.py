@@ -1,4 +1,4 @@
-!pip install streamlit opencv-python pytesseract numpy
+
 
 import streamlit as st
 import cv2
