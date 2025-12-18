@@ -4,5 +4,5 @@ numpy
 Pillow
 easyocr
 pyspellchecker
-paddleocr
-paddlepaddle
+torch
+torchvision
