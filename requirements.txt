@@ -6,3 +6,11 @@ easyocr
 pyspellchecker
 torch
 torchvision
+streamlit
+opencv-python-headless
+numpy
+Pillow
+easyocr
+pyspellchecker
+torch
+torchvision
