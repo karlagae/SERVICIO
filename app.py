@@ -70,14 +70,9 @@ def detectar_cuadros_grandes(
     close_kernel=7,
     close_iter=2
 ):
-    """
-    Detecta paneles grandes (rectángulos) en formularios.
-    Funciona bien cuando hay bordes rectos o líneas de tabla.
-    """
     H, W = img_bgr.shape[:2]
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-    # Binarización robusta
     th = cv2.adaptiveThreshold(
         gray, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -85,20 +80,18 @@ def detectar_cuadros_grandes(
         31, 9
     )
 
-    # Detectar líneas horizontales
+    # líneas horizontales
     h_len = max(30, W // 25)
     h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))
     horiz = cv2.morphologyEx(th, cv2.MORPH_OPEN, h_kernel, iterations=1)
 
-    # Detectar líneas verticales
+    # líneas verticales
     v_len = max(30, H // 25)
     v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_len))
     vert = cv2.morphologyEx(th, cv2.MORPH_OPEN, v_kernel, iterations=1)
 
-    # Unir líneas
     mask = cv2.add(horiz, vert)
 
-    # Cerrar huecos para formar rectángulos (controlable con sliders)
     k = max(3, int(close_kernel))
     mask = cv2.morphologyEx(
         mask,
@@ -117,7 +110,6 @@ def detectar_cuadros_grandes(
         area = w * h
         area_ratio = area / img_area
 
-        # Filtros por tamaño relativo (para quedarte con "grandes")
         if area_ratio < min_area_ratio:
             continue
         if area_ratio > max_area_ratio:
@@ -129,7 +121,6 @@ def detectar_cuadros_grandes(
 
         boxes.append((x, y, w, h))
 
-    # Quitar duplicados/solapamientos fuertes (opcional, suave)
     boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
 
     def iou(a, b):
@@ -140,7 +131,7 @@ def detectar_cuadros_grandes(
         x2 = min(ax + aw, bx + bw)
         y2 = min(ay + ah, by + bh)
         inter = max(0, x2 - x1) * max(0, y2 - y1)
-        union = aw*ah + bw*bh - inter
+        union = aw * ah + bw * bh - inter
         return inter / union if union > 0 else 0
 
     final = []
@@ -151,28 +142,15 @@ def detectar_cuadros_grandes(
     return final
 
 # =============================
-#  (Opcional) Subcuadros exactos (si después lo necesitas)
-
-
-
-
-
+#  Split: dividir cuadros pegados (como tu "Cuadro 4")
+# =============================
 def _split_por_valles_verticales(crop_bin, min_gap_px=18):
-    """
-    crop_bin: imagen binaria (blanco = tinta) de un recorte.
-    Regresa posiciones x donde conviene cortar (valles).
-    """
-    # Suma de tinta por columna
     col_sum = crop_bin.sum(axis=0) / 255.0
-
-    # Normaliza
     if col_sum.max() > 0:
         col_sum = col_sum / col_sum.max()
 
-    # Valle = columna con poca tinta
     valle = col_sum < 0.08
 
-    # Agrupa columnas consecutivas "valle"
     cuts = []
     start = None
     for i, v in enumerate(valle):
@@ -190,12 +168,7 @@ def _split_por_valles_verticales(crop_bin, min_gap_px=18):
 
     return cuts
 
-
 def dividir_cuadros_pegados(img_bgr, boxes, split_w_ratio=0.55, min_gap_px=18):
-    """
-    Si un cuadro es MUY ancho, intenta partirlo en 2-3 usando valles verticales.
-    Devuelve lista nueva de boxes.
-    """
     H, W = img_bgr.shape[:2]
     out = []
 
@@ -208,36 +181,33 @@ def dividir_cuadros_pegados(img_bgr, boxes, split_w_ratio=0.55, min_gap_px=18):
     )
 
     for (x, y, w, h) in boxes:
-        # si NO es tan ancho, lo dejamos igual
         if w < W * split_w_ratio:
             out.append((x, y, w, h))
             continue
 
-        crop = th[y:y+h, x:x+w]
+        crop = th[y:y + h, x:x + w]
         cuts = _split_por_valles_verticales(crop, min_gap_px=min_gap_px)
 
-        # Si no encontró cortes confiables, no dividir
         if len(cuts) == 0:
             out.append((x, y, w, h))
             continue
 
-        # Armamos segmentos entre cortes (incluye bordes)
         xs = [0] + cuts + [w]
         for i in range(len(xs) - 1):
             x0 = xs[i]
-            x1 = xs[i+1]
+            x1 = xs[i + 1]
             seg_w = x1 - x0
 
-            # filtro: evita segmentos demasiado delgados
             if seg_w < 0.12 * W:
                 continue
 
             out.append((x + x0, y, seg_w, h))
 
-    # Orden visual
     out = sorted(out, key=lambda b: (b[1], b[0]))
     return out
 
+# =============================
+#  Subcuadros (opcional)
 # =============================
 def detectar_subcuadros(img_bgr):
     H, W = img_bgr.shape[:2]
@@ -253,18 +223,19 @@ def detectar_subcuadros(img_bgr):
         x, y, w, h = cv2.boundingRect(cnt)
         if (w < 50 and h < 50):
             continue
-        if (w > 0.95*W and h > 0.95*H):
+        if (w > 0.95 * W and h > 0.95 * H):
             continue
         if w > 160 and h > 70:
             boxes.append((x, y, w, h))
+
     boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
     return boxes
 
 def dibujar_cuadros(img_bgr, boxes):
     vis = img_bgr.copy()
     for i, (x, y, w, h) in enumerate(boxes):
-        cv2.rectangle(vis, (x, y), (x+w, y+h), (0, 0, 255), 3)
-        cv2.putText(vis, str(i), (x, max(20, y-10)),
+        cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 0, 255), 3)
+        cv2.putText(vis, str(i), (x, max(20, y - 10)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
     return vis
 
@@ -303,6 +274,15 @@ if modo == "Cuadros grandes (hoja completa)":
         close_kernel=close_kernel,
         close_iter=close_iter
     )
+
+    # ✅ Split automático (para cuadros que vienen "pegados")
+    activar_split = st.sidebar.checkbox("Dividir cuadros pegados (split automático)", value=True)
+    split_w_ratio = st.sidebar.slider("Split: umbral de ancho (% del ancho)", 35, 90, 55, 1) / 100.0
+    min_gap_px = st.sidebar.slider("Split: separación mínima (px)", 8, 60, 18, 1)
+
+    if activar_split and boxes:
+        boxes = dividir_cuadros_pegados(img_bgr, boxes, split_w_ratio=split_w_ratio, min_gap_px=min_gap_px)
+
 else:
     boxes = detectar_subcuadros(img_bgr)
 
@@ -316,7 +296,7 @@ st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), use_container_width=True)
 
 idx = st.selectbox("Selecciona un cuadro", list(range(len(boxes))), format_func=lambda i: f"Cuadro {i}")
 x, y, w, h = boxes[idx]
-crop = img_bgr[y:y+h, x:x+w]
+crop = img_bgr[y:y + h, x:x + w]
 
 col1, col2 = st.columns(2)
 with col1:
@@ -326,11 +306,13 @@ with col1:
 with col2:
     st.subheader("OCR + Autocorrector")
     texto_ocr = ocr_easy(crop)
-    st.text_area("1) OCR (crudo)", texto_ocr, height=160)
+    st.text_area("OCR (crudo)", texto_ocr, height=160)
 
     if st.checkbox("Aplicar autocorrector", value=True):
         texto_ok, cambios = autocorregir_texto(texto_ocr)
-        st.text_area("2) Corregido", texto_ok, height=160)
+        st.text_area("Corregido", texto_ok, height=160)
         if cambios:
-            st.dataframe({"Original": [c[0] for c in cambios], "Sugerido": [c[1] for c in cambios]},
-                         use_container_width=True)
+            st.dataframe(
+                {"Original": [c[0] for c in cambios], "Sugerido": [c[1] for c in cambios]},
+                use_container_width=True
+            )
