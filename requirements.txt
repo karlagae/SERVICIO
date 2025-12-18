@@ -3,5 +3,12 @@ opencv-python-headless
 numpy
 Pillow
 easyocr
-pip install pyspellchecker
-pip install pyspellchecker
+
+streamlit
+opencv-python
+numpy
+Pillow
+easyocr
+pyspellchecker
+torch
+torchvision
