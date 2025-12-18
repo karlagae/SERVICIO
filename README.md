@@ -84,3 +84,22 @@ if uploaded:
 
             texto = ocr(crop)
             st.text_area("Texto extraído", texto, height=250)
+# 🖱️ OCR por Recuadros con Streamlit
+
+Aplicación en **Streamlit** que detecta recuadros en imágenes escaneadas,
+extrae texto con **EasyOCR** y muestra una versión **autocorregida tipo Word**
+usando un corrector ortográfico en español.
+
+## ✨ Funcionalidades
+- Detección automática de recuadros
+- Selección visual del recuadro
+- OCR en español
+- Autocorrección ortográfica
+- Comparación OCR vs texto corregido
+
+## 🚀 Instalación
+
+```bash
+git clone https://github.com/tu-usuario/tu-repo.git
+cd tu-repo
+pip install -r requirements.txt
