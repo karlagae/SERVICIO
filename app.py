@@ -7,7 +7,7 @@ import re
 from spellchecker import SpellChecker
 
 # =============================
-#  OCR con EasyOCR (cacheado)
+# OCR (EasyOCR)
 # =============================
 @st.cache_resource
 def get_ocr_reader():
@@ -17,11 +17,11 @@ reader = get_ocr_reader()
 
 def ocr_easy(img_bgr: np.ndarray) -> str:
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    results = reader.readtext(img_rgb, detail=0)
-    return " ".join(results).strip()
+    parts = reader.readtext(img_rgb, detail=0)
+    return " ".join(parts).strip()
 
 # =============================
-#  Autocorrector tipo Word
+# Autocorrector (diccionario)
 # =============================
 @st.cache_resource
 def get_spellchecker():
@@ -45,6 +45,7 @@ def autocorregir_texto(texto: str):
         if lower in desconocidas:
             sugerida = spell.correction(lower) or lower
 
+            # Respeta capitalización
             if palabra.isupper():
                 sugerida = sugerida.upper()
             elif palabra[0].isupper():
@@ -59,7 +60,7 @@ def autocorregir_texto(texto: str):
     return texto_corregido, cambios
 
 # =============================
-#  Utilidades: IoU / Contención
+# Geometría / filtros
 # =============================
 def _iou(a, b):
     ax, ay, aw, ah = a
@@ -78,188 +79,126 @@ def _contiene(a, b, margen=6):
         ax + aw >= bx + bw - margen and ay + ah >= by + bh - margen
     )
 
-def quitar_padres(boxes):
-    """
-    Elimina cajas "padre" que contienen otras (evita duplicados tipo borde externo/interno).
-    """
-    if not boxes:
-        return []
-    boxes = sorted(boxes, key=lambda b: b[2] * b[3])  # pequeñas primero
-    keep = []
-    for b in boxes:
-        if any(_contiene(b, k) for k in keep):
-            continue
-        keep.append(b)
-    return sorted(keep, key=lambda b: (b[1], b[0]))
-
-def deduplicar_boxes(boxes, iou_thr=0.55):
-    """
-    Deduplicado final por IoU.
-    """
-    if not boxes:
-        return []
-    boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)  # grandes primero
-    final = []
-    for b in boxes:
-        if all(_iou(b, f) < iou_thr for f in final):
-            final.append(b)
-    return sorted(final, key=lambda b: (b[1], b[0]))
+def _rectangularidad(contour, w, h):
+    """Qué tan 'rectángulo lleno' es el contorno vs su bounding box."""
+    area_c = abs(cv2.contourArea(contour))
+    area_r = float(w * h) if w > 0 and h > 0 else 1.0
+    return area_c / area_r
 
 # =============================
-#  Detección: CUADROS GRANDES (hoja completa)
+# Detección AUTOMÁTICA de cuadros grandes (Cloud-friendly)
+#   - Construye máscara de líneas
+#   - Busca contornos con jerarquía (RETR_TREE)
+#   - Se queda con rectángulos reales (approx 4 vértices)
+#   - Quita "contenedores" que engloban varios cuadros
 # =============================
-def detectar_cuadros_grandes(
-    img_bgr,
-    min_area_ratio=0.003,   # 0.3% (mejor para Adobe Scan)
-    max_area_ratio=0.80,
-    min_w_ratio=0.12,
-    min_h_ratio=0.03,
-    close_kernel=11,
-    close_iter=3
-):
+def detectar_cuadros_grandes_automatico(img_bgr: np.ndarray):
     H, W = img_bgr.shape[:2]
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
+    # Suaviza un poco para estabilizar threshold
+    gray_blur = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    # Binarización (líneas negras -> blanco)
     th = cv2.adaptiveThreshold(
-        gray, 255,
+        gray_blur, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
         31, 9
     )
 
-    # Detectar líneas horizontales y verticales
-    h_len = max(30, W // 25)
-    v_len = max(30, H // 25)
+    # Máscara de líneas (horizontal + vertical)
+    h_len = max(40, W // 18)
+    v_len = max(40, H // 18)
     h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))
     v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_len))
 
     horiz = cv2.morphologyEx(th, cv2.MORPH_OPEN, h_kernel, iterations=1)
     vert  = cv2.morphologyEx(th, cv2.MORPH_OPEN, v_kernel, iterations=1)
-
     mask = cv2.add(horiz, vert)
 
-    # Cerrar huecos para formar rectángulos
-    k = max(3, int(close_kernel))
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)),
-        iterations=max(1, int(close_iter))
-    )
+    # Cerrar pequeños huecos para que los rectángulos queden "cerrados"
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=2)
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Contornos con jerarquía (IMPORTANTÍSIMO para evitar duplicados)
+    contours, hierarchy = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    if hierarchy is None:
+        return []
 
-    boxes = []
     img_area = float(H * W)
 
+    candidatos = []
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
         area_ratio = (w * h) / img_area
 
-        if area_ratio < min_area_ratio:
+        # Filtra por tamaño (cuadros GRANDES)
+        if area_ratio < 0.006:   # 0.6% (baja para adobe scan)
             continue
-        if area_ratio > max_area_ratio:
-            continue
-        if w < W * min_w_ratio:
-            continue
-        if h < H * min_h_ratio:
+        if area_ratio > 0.85:    # evita mega-cuadro de la hoja
             continue
 
-        boxes.append((x, y, w, h))
-
-    return sorted(boxes, key=lambda b: (b[1], b[0]))
-
-# =============================
-#  Split V2: partir cuadros anchos (cuando engloba 2-3 paneles)
-# =============================
-def dividir_cuadros_pegados(img_bgr, boxes, split_w_ratio=0.35, min_gap_px=12):
-    H, W = img_bgr.shape[:2]
-    out = []
-
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    th = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        31, 9
-    )
-
-    # máscara de líneas (más robusta para tablas)
-    h_len = max(30, W // 25)
-    v_len = max(30, H // 25)
-    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))
-    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_len))
-    horiz = cv2.morphologyEx(th, cv2.MORPH_OPEN, h_kernel, iterations=1)
-    vert  = cv2.morphologyEx(th, cv2.MORPH_OPEN, v_kernel, iterations=1)
-    line_mask = cv2.add(horiz, vert)
-
-    for (x, y, w, h) in boxes:
-        if w < W * split_w_ratio:
-            out.append((x, y, w, h))
+        # evita “tiras” verticales inventadas
+        if w < 0.18 * W:
+            continue
+        if h < 0.03 * H:
             continue
 
-        crop = line_mask[y:y + h, x:x + w]
-
-        # proyección vertical
-        col = crop.sum(axis=0) / 255.0
-        if col.max() > 0:
-            col = col / col.max()
-
-        # suavizado
-        k = 21 if w > 500 else 11
-        kernel = np.ones(k) / k
-        col_s = np.convolve(col, kernel, mode="same")
-
-        # valles (zonas "vacías" donde cortar)
-        valle = col_s < 0.12
-
-        cuts = []
-        start = None
-        for i, v in enumerate(valle):
-            if v and start is None:
-                start = i
-            if (not v) and start is not None:
-                end = i - 1
-                if (end - start) >= min_gap_px:
-                    cuts.append((start + end) // 2)
-                start = None
-        if start is not None:
-            end = len(valle) - 1
-            if (end - start) >= min_gap_px:
-                cuts.append((start + end) // 2)
-
-        if not cuts:
-            out.append((x, y, w, h))
+        # Aproxima a polígono y exige 4 lados
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        if len(approx) != 4:
             continue
 
-        xs = [0] + cuts + [w]
-        for i in range(len(xs) - 1):
-            x0, x1 = xs[i], xs[i + 1]
-            seg_w = x1 - x0
-            if seg_w < 0.10 * W:  # evita pedacitos
-                continue
-            out.append((x + x0, y, seg_w, h))
+        # Rectangularidad: el contorno debe parecerse a su bbox
+        rect_score = _rectangularidad(cnt, w, h)
+        if rect_score < 0.25:
+            continue
 
-    return sorted(out, key=lambda b: (b[1], b[0]))
+        candidatos.append((x, y, w, h))
 
-# =============================
-#  Dibujo
-# =============================
+    # Orden visual
+    candidatos = sorted(candidatos, key=lambda b: (b[1], b[0]))
+
+    # Deduplicado suave por IoU (elimina bordes casi iguales)
+    dedup = []
+    for b in candidatos:
+        if all(_iou(b, d) < 0.70 for d in dedup):
+            dedup.append(b)
+
+    # Quitar "contenedores": si una caja contiene a 2+ cajas, se elimina
+    # (esto mata el cuadro que engloba 3 secciones)
+    finales = []
+    for b in dedup:
+        hijos = [c for c in dedup if c != b and _contiene(b, c, margen=10)]
+        if len(hijos) >= 2:
+            # b es contenedor -> descartar
+            continue
+        finales.append(b)
+
+    # Segundo deduplicado por seguridad
+    finales2 = []
+    for b in sorted(finales, key=lambda x: x[2]*x[3], reverse=True):
+        if all(_iou(b, f) < 0.55 for f in finales2):
+            finales2.append(b)
+
+    finales2 = sorted(finales2, key=lambda b: (b[1], b[0]))
+    return finales2
+
 def dibujar_cuadros(img_bgr, boxes):
     vis = img_bgr.copy()
     for i, (x, y, w, h) in enumerate(boxes):
         cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 0, 255), 3)
-        cv2.putText(
-            vis, str(i), (x, max(20, y - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2
-        )
+        cv2.putText(vis, str(i), (x, max(20, y - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
     return vis
 
 # =============================
-#  App Streamlit
+# App Streamlit
 # =============================
-st.set_page_config(page_title="Extractor por cuadros", layout="wide")
-st.title("🧾 Detector de cuadros + OCR + Autocorrector")
+st.set_page_config(page_title="Detector de cuadros + OCR", layout="wide")
+st.title("🧾 Detector automático de cuadros grandes + OCR + Autocorrector")
 
 uploaded = st.file_uploader("Sube una imagen JPG/PNG", type=["png", "jpg", "jpeg"])
 if not uploaded:
@@ -270,73 +209,18 @@ pil_img = Image.open(uploaded).convert("RGB")
 img_rgb = np.array(pil_img)
 img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
 
-st.sidebar.header("⚙️ Parámetros (ajustables)")
+# Detecta AUTOMÁTICO (sin sliders)
+boxes = detectar_cuadros_grandes_automatico(img_bgr)
 
-min_area_ratio = st.sidebar.slider("Área mínima (%)", 0.1, 5.0, 0.3, 0.1) / 100.0
-max_area_ratio = st.sidebar.slider("Área máxima (%)", 5.0, 90.0, 80.0, 1.0) / 100.0
-min_w_ratio = st.sidebar.slider("Ancho mínimo (% ancho)", 5, 60, 12, 1) / 100.0
-min_h_ratio = st.sidebar.slider("Alto mínimo (% alto)", 2, 40, 3, 1) / 100.0
-close_kernel = st.sidebar.slider("Close kernel", 3, 25, 11, 2)
-close_iter = st.sidebar.slider("Close iteraciones", 1, 5, 3, 1)
-
-activar_split = st.sidebar.checkbox("Dividir cuadros pegados", value=True)
-split_w_ratio = st.sidebar.slider("Split: umbral ancho (% ancho)", 25, 90, 35, 1) / 100.0
-min_gap_px = st.sidebar.slider("Split: separación mínima (px)", 8, 60, 12, 1)
-
-iou_thr = st.sidebar.slider("Deduplicar: IoU umbral", 0.40, 0.90, 0.55, 0.01)
-
-# ---- Pipeline de detección ----
-boxes = detectar_cuadros_grandes(
-    img_bgr,
-    min_area_ratio=min_area_ratio,
-    max_area_ratio=max_area_ratio,
-    min_w_ratio=min_w_ratio,
-    min_h_ratio=min_h_ratio,
-    close_kernel=close_kernel,
-    close_iter=close_iter
-)
-
-if activar_split and boxes:
-    boxes = dividir_cuadros_pegados(img_bgr, boxes, split_w_ratio=split_w_ratio, min_gap_px=min_gap_px)
-
-boxes = quitar_padres(boxes)
-boxes = deduplicar_boxes(boxes, iou_thr=iou_thr)
-
-# ---- Fallback automático si no detecta nada ----
 if not boxes:
-    st.warning(
-        "No se detectaron cuadros con estos parámetros. "
-        "Probando configuración más flexible automáticamente..."
-    )
+    st.error("No pude detectar cuadros grandes automáticamente en esta imagen.")
+    st.stop()
 
-    boxes = detectar_cuadros_grandes(
-        img_bgr,
-        min_area_ratio=0.002,   # 0.2%
-        max_area_ratio=0.90,
-        min_w_ratio=0.10,
-        min_h_ratio=0.025,
-        close_kernel=13,
-        close_iter=3
-    )
-    boxes = dividir_cuadros_pegados(img_bgr, boxes, split_w_ratio=0.35, min_gap_px=12)
-    boxes = quitar_padres(boxes)
-    boxes = deduplicar_boxes(boxes, iou_thr=0.55)
-
-    if not boxes:
-        st.error("No fue posible detectar cuadros automáticamente en esta imagen.")
-        st.stop()
-
-# ---- UI ----
 vis = dibujar_cuadros(img_bgr, boxes)
-st.subheader("Imagen con cuadros detectados")
+st.subheader("Imagen con cuadros detectados (automático)")
 st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), use_container_width=True)
 
-idx = st.selectbox(
-    "Selecciona un cuadro",
-    list(range(len(boxes))),
-    format_func=lambda i: f"Cuadro {i}"
-)
-
+idx = st.selectbox("Selecciona un cuadro", list(range(len(boxes))), format_func=lambda i: f"Cuadro {i}")
 x, y, w, h = boxes[idx]
 crop = img_bgr[y:y + h, x:x + w]
 
@@ -351,8 +235,7 @@ with col2:
     texto_ocr = ocr_easy(crop)
     st.text_area("OCR (crudo)", texto_ocr, height=180)
 
-    usar_autocorrector = st.checkbox("Aplicar autocorrector", value=True)
-    if usar_autocorrector:
+    if st.checkbox("Aplicar autocorrector", value=True):
         texto_ok, cambios = autocorregir_texto(texto_ocr)
         st.text_area("Corregido", texto_ok, height=180)
 
