@@ -57,7 +57,7 @@ def autocorregir_texto(texto: str):
     return texto_corregido, cambios
 
 # =============================
-# Utils geométricos
+# Utils
 # =============================
 def iou(a, b):
     ax, ay, aw, ah = a
@@ -68,8 +68,7 @@ def iou(a, b):
     union = aw * ah + bw * bh - inter
     return inter / union if union > 0 else 0.0
 
-def deduplicar_boxes(boxes, thr=0.70):
-    # conserva el más grande cuando hay solapes fuertes
+def deduplicar_boxes(boxes, thr=0.75):
     boxes = sorted(boxes, key=lambda b: b[2]*b[3], reverse=True)
     out = []
     for b in boxes:
@@ -77,129 +76,109 @@ def deduplicar_boxes(boxes, thr=0.70):
             out.append(b)
     return sorted(out, key=lambda b: (b[1], b[0]))
 
-# =============================
-# Detector: SUBCUADROS EN TODA LA HOJA (lo que tú pides)
-# =============================
-def detectar_subcuadros_hoja(img_bgr: np.ndarray, sensibilidad: float = 0.70):
-    """
-    Detecta paneles/rectángulos grandes del formulario (Respiración, Circulación, etc.)
-    directamente en TODA la hoja.
+def contar_hijos(boxes, parent):
+    px, py, pw, ph = parent
+    c = 0
+    for b in boxes:
+        if b == parent:
+            continue
+        x, y, w, h = b
+        if x >= px and y >= py and (x+w) <= (px+pw) and (y+h) <= (py+ph):
+            c += 1
+    return c
 
-    sensibilidad:
-      0.0 -> más conservador (menos cuadros)
-      1.0 -> más agresivo (más cuadros)
-    """
+# =============================
+# DETECTOR ROBUSTO: CUADROS GRANDES DEL FORMULARIO
+# (Datos personales, Signos vitales, Respiración, Circulación, etc.)
+# =============================
+def detectar_cuadros_formulario(img_bgr: np.ndarray, sensibilidad: float = 0.85):
     H, W = img_bgr.shape[:2]
     img_area = float(H * W)
 
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    # 1) binarización
+    # 1) binarización (líneas negras -> blanco en th)
     th = cv2.adaptiveThreshold(
         gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.ADAPTIVE_THRESH_MEAN_C,
         cv2.THRESH_BINARY_INV,
-        31, 9
+        31, 12
     )
 
-    # 2) bordes
-    edges = cv2.Canny(th, 50, 150)
+    # 2) extraer líneas (esto es clave)
+    #    OJO: kernels GRANDES para quedarnos con líneas de tablas, no texto
+    h_len = int(max(40, W * (0.10 - 0.05 * sensibilidad)))   # ~10% del ancho
+    v_len = int(max(40, H * (0.08 - 0.04 * sensibilidad)))   # ~8% del alto
+    h_len = max(30, min(h_len, 160))
+    v_len = max(30, min(v_len, 160))
 
-    # 3) cerrar huecos pequeños (OJO: kernel chico para NO juntar paneles)
-    #    kernel sube un poquito con sensibilidad, pero con límite
-    k = int(3 + 4 * sensibilidad)   # 3..7
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_len))
+
+    horiz = cv2.morphologyEx(th, cv2.MORPH_OPEN, h_kernel, iterations=1)
+    vert  = cv2.morphologyEx(th, cv2.MORPH_OPEN, v_kernel, iterations=1)
+
+    mask = cv2.add(horiz, vert)
+
+    # 3) cerrar huequitos (pero sin pegar paneles distintos)
+    k = int(3 + 4 * sensibilidad)  # 3..7
     k = max(3, min(7, k))
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=1)
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
 
-    # 4) contornos (TREE para encontrar cuadros internos)
-    contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    # 4) contornos
+    contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-    # ====== filtros dinámicos (por tamaño relativo)
-    # área mínima: baja con sensibilidad
-    min_area_ratio = 0.006 - 0.003 * sensibilidad   # 0.6% -> 0.3%
-    min_area_ratio = max(0.0025, min_area_ratio)
+    # 5) filtros para QUEDARNOS con cuadros GRANDES (no checkboxes)
+    #    min_area baja con sensibilidad
+    min_area_ratio = 0.004 - 0.002 * sensibilidad   # 0.4% -> 0.2%
+    min_area_ratio = max(0.0015, min_area_ratio)
 
-    # área máxima: evita mega-cuadros
-    max_area_ratio = 0.40
-
-    # ancho/alto mínimos: bajan con sensibilidad
-    min_w_ratio = 0.22 - 0.08 * sensibilidad        # 22% -> 14%
-    min_h_ratio = 0.06 - 0.02 * sensibilidad        # 6% -> 4%
+    # ancho/alto mínimos (relativos)
+    min_w_ratio = 0.18 - 0.06 * sensibilidad        # 18% -> 12%
+    min_h_ratio = 0.05 - 0.02 * sensibilidad        # 5%  -> 3%
     min_w_ratio = max(0.10, min_w_ratio)
     min_h_ratio = max(0.03, min_h_ratio)
 
-    # evita checkboxes
-    min_abs_w = int(60)
-    min_abs_h = int(60)
+    max_area_ratio = 0.70  # permite “Datos personales” completo, pero evita el marco total
 
     boxes = []
-
     for cnt in contours:
-        peri = cv2.arcLength(cnt, True)
-        if peri < 50:
-            continue
+        x, y, w, h = cv2.boundingRect(cnt)
 
-        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)  # aproximación a polígono
-
-        # Queremos rectángulos (4 lados) y convexos
-        if len(approx) != 4 or not cv2.isContourConvex(approx):
-            continue
-
-        x, y, w, h = cv2.boundingRect(approx)
-
-        # quita checkboxes
-        if w < min_abs_w and h < min_abs_h:
+        # evita mini cosas
+        if w < 90 or h < 70:
             continue
 
         area_ratio = (w * h) / img_area
-
-        # quita mega-cuadro
+        if area_ratio < min_area_ratio:
+            continue
         if area_ratio > max_area_ratio:
             continue
 
-        # muy pequeño
-        if area_ratio < min_area_ratio:
-            continue
-
-        # filtros por proporción
         if w < W * min_w_ratio:
             continue
         if h < H * min_h_ratio:
             continue
 
-        # quita “marco exterior” pegado a bordes
-        margin = int(0.01 * min(W, H))
-        if x <= margin or y <= margin or (x + w) >= (W - margin) or (y + h) >= (H - margin):
-            continue
-
         boxes.append((x, y, w, h))
 
-    # quitar duplicados por solape
-    boxes = deduplicar_boxes(boxes, thr=0.72)
+    # 6) deduplicar
+    boxes = deduplicar_boxes(boxes, thr=0.78)
 
-    # extra: eliminar cajas que contienen a otras muchas (típico cuadro padre)
-    # (conserva las más “útiles”)
-    final = []
+    # 7) quitar cuadros "padre" que engloban demasiado
+    #    (ej. un cuadro enorme que contiene muchos)
+    refined = []
     for b in boxes:
-        bx, by, bw, bh = b
-        contains = 0
-        for c in boxes:
-            if c == b:
-                continue
-            cx, cy, cw, ch = c
-            if cx >= bx and cy >= by and (cx+cw) <= (bx+bw) and (cy+ch) <= (by+bh):
-                contains += 1
-        # si contiene demasiadas, es “padre” y lo quitamos
-        if contains >= 4:
+        hijos = contar_hijos(boxes, b)
+        # si contiene muchísimos, es padre; lo quitamos
+        if hijos >= 6:
             continue
-        final.append(b)
+        refined.append(b)
 
-    final = deduplicar_boxes(final, thr=0.70)
-    return final
+    refined = deduplicar_boxes(refined, thr=0.75)
+    return refined
 
-# =============================
 def dibujar_cuadros(img_bgr, boxes):
     vis = img_bgr.copy()
     for i, (x, y, w, h) in enumerate(boxes):
@@ -211,8 +190,8 @@ def dibujar_cuadros(img_bgr, boxes):
 # =============================
 # App Streamlit
 # =============================
-st.set_page_config(page_title="Subcuadros + OCR", layout="wide")
-st.title("🧾 Subcuadros automáticos (toda la hoja) + OCR + Autocorrector")
+st.set_page_config(page_title="Detector de cuadros + OCR", layout="wide")
+st.title("🧾 Detector de cuadros del formulario + OCR + Autocorrector")
 
 uploaded = st.file_uploader("Sube una imagen JPG/PNG", type=["png", "jpg", "jpeg"])
 if not uploaded:
@@ -224,19 +203,19 @@ img_rgb = np.array(pil_img)
 img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
 
 st.sidebar.header("⚙️ Detección")
-sens = st.sidebar.slider("Sensibilidad (más alto = detecta más)", 0.0, 1.0, 0.85, 0.05)
+sens = st.sidebar.slider("Sensibilidad (más alto = detecta más cuadros)", 0.0, 1.0, 0.90, 0.05)
 
-boxes = detectar_subcuadros_hoja(img_bgr, sensibilidad=sens)
+boxes = detectar_cuadros_formulario(img_bgr, sensibilidad=sens)
 
 if not boxes:
-    st.warning("No se detectaron subcuadros. Sube la sensibilidad a 0.95–1.0.")
+    st.warning("No se detectaron cuadros. Sube la sensibilidad a 0.95–1.0.")
     st.stop()
 
 vis = dibujar_cuadros(img_bgr, boxes)
-st.subheader(f"Subcuadros detectados: {len(boxes)}")
+st.subheader(f"Cuadros detectados: {len(boxes)}")
 st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), use_container_width=True)
 
-idx = st.selectbox("Selecciona un subcuadro", list(range(len(boxes))), format_func=lambda i: f"Subcuadro {i}")
+idx = st.selectbox("Selecciona un cuadro", list(range(len(boxes))), format_func=lambda i: f"Cuadro {i}")
 x, y, w, h = boxes[idx]
 crop = img_bgr[y:y+h, x:x+w]
 
