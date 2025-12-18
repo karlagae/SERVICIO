@@ -6,3 +6,4 @@ easyocr
 pyspellchecker
 torch
 torchvision
+opencv-python-headless
