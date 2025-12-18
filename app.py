@@ -152,6 +152,92 @@ def detectar_cuadros_grandes(
 
 # =============================
 #  (Opcional) Subcuadros exactos (si después lo necesitas)
+
+
+
+
+
+def _split_por_valles_verticales(crop_bin, min_gap_px=18):
+    """
+    crop_bin: imagen binaria (blanco = tinta) de un recorte.
+    Regresa posiciones x donde conviene cortar (valles).
+    """
+    # Suma de tinta por columna
+    col_sum = crop_bin.sum(axis=0) / 255.0
+
+    # Normaliza
+    if col_sum.max() > 0:
+        col_sum = col_sum / col_sum.max()
+
+    # Valle = columna con poca tinta
+    valle = col_sum < 0.08
+
+    # Agrupa columnas consecutivas "valle"
+    cuts = []
+    start = None
+    for i, v in enumerate(valle):
+        if v and start is None:
+            start = i
+        if (not v) and start is not None:
+            end = i - 1
+            if (end - start) >= min_gap_px:
+                cuts.append((start + end) // 2)
+            start = None
+    if start is not None:
+        end = len(valle) - 1
+        if (end - start) >= min_gap_px:
+            cuts.append((start + end) // 2)
+
+    return cuts
+
+
+def dividir_cuadros_pegados(img_bgr, boxes, split_w_ratio=0.55, min_gap_px=18):
+    """
+    Si un cuadro es MUY ancho, intenta partirlo en 2-3 usando valles verticales.
+    Devuelve lista nueva de boxes.
+    """
+    H, W = img_bgr.shape[:2]
+    out = []
+
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    th = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31, 9
+    )
+
+    for (x, y, w, h) in boxes:
+        # si NO es tan ancho, lo dejamos igual
+        if w < W * split_w_ratio:
+            out.append((x, y, w, h))
+            continue
+
+        crop = th[y:y+h, x:x+w]
+        cuts = _split_por_valles_verticales(crop, min_gap_px=min_gap_px)
+
+        # Si no encontró cortes confiables, no dividir
+        if len(cuts) == 0:
+            out.append((x, y, w, h))
+            continue
+
+        # Armamos segmentos entre cortes (incluye bordes)
+        xs = [0] + cuts + [w]
+        for i in range(len(xs) - 1):
+            x0 = xs[i]
+            x1 = xs[i+1]
+            seg_w = x1 - x0
+
+            # filtro: evita segmentos demasiado delgados
+            if seg_w < 0.12 * W:
+                continue
+
+            out.append((x + x0, y, seg_w, h))
+
+    # Orden visual
+    out = sorted(out, key=lambda b: (b[1], b[0]))
+    return out
+
 # =============================
 def detectar_subcuadros(img_bgr):
     H, W = img_bgr.shape[:2]
