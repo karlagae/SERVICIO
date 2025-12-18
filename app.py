@@ -58,11 +58,10 @@ def autocorregir_texto(texto: str):
     texto_corregido = re.sub(patron, corregir_match, texto)
     return texto_corregido, cambios
 
-
 # =============================
-#  Helpers de boxes (NUEVO)
+#  Helpers de boxes
 # =============================
-def _iou(a, b):
+def iou(a, b):
     ax, ay, aw, ah = a
     bx, by, bw, bh = b
     x1 = max(ax, bx)
@@ -73,176 +72,14 @@ def _iou(a, b):
     union = aw*ah + bw*bh - inter
     return inter / union if union > 0 else 0.0
 
-def _deduplicar_boxes(boxes, thr=0.80):
-    # deja el más grande cuando se empalman fuerte
+def deduplicar_boxes(boxes, thr=0.80):
+    # Mantiene la caja más grande cuando se empalman mucho (evita 0=1, 2=3)
     boxes = sorted(boxes, key=lambda b: b[2]*b[3], reverse=True)
     out = []
     for b in boxes:
-        if all(_iou(b, o) < thr for o in out):
+        if all(iou(b, o) < thr for o in out):
             out.append(b)
     return sorted(out, key=lambda b: (b[1], b[0]))
-
-def _quitar_padres_que_engloban(boxes):
-    # elimina cajas "padre" que contienen muchas otras
-    out = []
-    for b in boxes:
-        bx, by, bw, bh = b
-        hijos = 0
-        for c in boxes:
-            if c == b:
-                continue
-            x, y, w, h = c
-            inside = (x >= bx and y >= by and (x+w) <= (bx+bw) and (y+h) <= (by+bh))
-            if inside and (w*h) < 0.92*(bw*bh):
-                hijos += 1
-        if hijos >= 6:   # si engloba muchas, es padre -> fuera
-            continue
-        out.append(b)
-    return out
-
-
-# =============================
-#  TU detector principal (lo dejo igual pero con nombre claro)
-#  (si ya lo tienes diferente, puedes reemplazar SOLO esta función)
-# =============================
-def detectar_cuadros_grandes(
-    img_bgr,
-    min_area_ratio=0.010,
-    max_area_ratio=0.80,
-    min_w_ratio=0.12,
-    min_h_ratio=0.03,
-    close_kernel=11,
-    close_iter=1
-):
-    H, W = img_bgr.shape[:2]
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-
-    th = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        31, 9
-    )
-
-    # líneas horizontales/verticales
-    h_len = max(30, W // 25)
-    v_len = max(30, H // 25)
-    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))
-    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_len))
-
-    horiz = cv2.morphologyEx(th, cv2.MORPH_OPEN, h_kernel, iterations=1)
-    vert  = cv2.morphologyEx(th, cv2.MORPH_OPEN, v_kernel, iterations=1)
-
-    mask = cv2.add(horiz, vert)
-
-    k = max(3, int(close_kernel))
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)),
-        iterations=max(1, int(close_iter))
-    )
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    boxes = []
-    img_area = float(H * W)
-
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-        area_ratio = (w*h) / img_area
-
-        if area_ratio < min_area_ratio:
-            continue
-        if area_ratio > max_area_ratio:
-            continue
-        if w < W * min_w_ratio:
-            continue
-        if h < H * min_h_ratio:
-            continue
-
-        boxes.append((x, y, w, h))
-
-    boxes = _deduplicar_boxes(boxes, thr=0.85)
-    return boxes
-
-
-# =============================
-#  REFUERZO: detector MEDIANO/PEQUEÑO (NUEVO)
-#  (este es el que te saca Respiración y Valoración)
-# =============================
-def detectar_cuadros_medianos(img_bgr):
-    H, W = img_bgr.shape[:2]
-    img_area = float(H * W)
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-
-    th = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_MEAN_C,
-        cv2.THRESH_BINARY_INV,
-        31, 12
-    )
-
-    # kernels más chicos
-    h_len = max(25, int(W * 0.045))
-    v_len = max(25, int(H * 0.040))
-
-    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))
-    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_len))
-
-    horiz = cv2.morphologyEx(th, cv2.MORPH_OPEN, h_kernel, iterations=1)
-    vert  = cv2.morphologyEx(th, cv2.MORPH_OPEN, v_kernel, iterations=1)
-
-    mask = cv2.add(horiz, vert)
-
-    # cerrar un poquito más para líneas rotas
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)),
-        iterations=1
-    )
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    boxes = []
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-        ar = (w*h) / img_area
-
-        # filtros para medianos
-        if w < 140 or h < 90:
-            continue
-        if ar < 0.0012 or ar > 0.35:
-            continue
-        if w < W * 0.10 or h < H * 0.035:
-            continue
-
-        boxes.append((x, y, w, h))
-
-    boxes = _deduplicar_boxes(boxes, thr=0.85)
-    return boxes
-
-
-# =============================
-#  FUSIÓN FINAL (NUEVO)
-# =============================
-def detectar_todos_los_cuadros(img_bgr, params_grandes):
-    grandes = detectar_cuadros_grandes(img_bgr, **params_grandes)
-    medianos = detectar_cuadros_medianos(img_bgr)
-
-    # unir
-    boxes = grandes + medianos
-
-    # quitar duplicados (arregla 0 y 1 iguales)
-    boxes = _deduplicar_boxes(boxes, thr=0.78)
-
-    # quitar padres (arregla cuadro 4 que junta 3)
-    boxes = _quitar_padres_que_engloban(boxes)
-    boxes = _deduplicar_boxes(boxes, thr=0.78)
-
-    return boxes
-
 
 def dibujar_cuadros(img_bgr, boxes):
     vis = img_bgr.copy()
@@ -252,6 +89,109 @@ def dibujar_cuadros(img_bgr, boxes):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
     return vis
 
+# =============================
+#  Detector robusto por líneas (2 escalas)
+# =============================
+def detectar_rectangulos_por_lineas(img_bgr, scale="big",
+                                   min_area_ratio=0.002,
+                                   max_area_ratio=0.90,
+                                   min_w_px=140,
+                                   min_h_px=80):
+    """
+    Detecta rectángulos cerrados usando extracción de líneas horizontales + verticales.
+    scale: "big" o "mid" (cambia tamaño de kernels).
+    """
+    H, W = img_bgr.shape[:2]
+    img_area = float(H * W)
+
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    # binarización (líneas negras -> blanco)
+    th = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31, 10
+    )
+
+    # kernels según escala
+    if scale == "big":
+        h_len = max(60, int(W * 0.12))
+        v_len = max(60, int(H * 0.10))
+        close_k = max(9, int(min(W, H) * 0.010))  # ~1%
+    else:  # "mid"
+        h_len = max(35, int(W * 0.06))
+        v_len = max(35, int(H * 0.05))
+        close_k = max(7, int(min(W, H) * 0.008))
+
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_len))
+
+    horiz = cv2.morphologyEx(th, cv2.MORPH_OPEN, h_kernel, iterations=1)
+    vert  = cv2.morphologyEx(th, cv2.MORPH_OPEN, v_kernel, iterations=1)
+
+    mask = cv2.add(horiz, vert)
+
+    # cerrar huecos para “cerrar” rectángulos
+    k = int(close_k)
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)),
+        iterations=1
+    )
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    boxes = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        area_ratio = (w * h) / img_area
+
+        if area_ratio < min_area_ratio:
+            continue
+        if area_ratio > max_area_ratio:
+            continue
+        if w < min_w_px or h < min_h_px:
+            continue
+
+        # evita el “mega cuadro” de toda la hoja si aparece
+        if w > 0.97 * W and h > 0.97 * H:
+            continue
+
+        boxes.append((x, y, w, h))
+
+    return boxes
+
+def detectar_todos_los_cuadros(img_bgr,
+                              min_area_pct=0.20,   # % área mínima
+                              max_area_pct=90.0,   # % área máxima
+                              min_w_px=140,
+                              min_h_px=80):
+    H, W = img_bgr.shape[:2]
+    min_area_ratio = min_area_pct / 100.0
+    max_area_ratio = max_area_pct / 100.0
+
+    big = detectar_rectangulos_por_lineas(
+        img_bgr, scale="big",
+        min_area_ratio=min_area_ratio,
+        max_area_ratio=max_area_ratio,
+        min_w_px=min_w_px,
+        min_h_px=min_h_px
+    )
+    mid = detectar_rectangulos_por_lineas(
+        img_bgr, scale="mid",
+        min_area_ratio=min_area_ratio * 0.45,     # más sensible
+        max_area_ratio=max_area_ratio,
+        min_w_px=max(110, int(min_w_px * 0.75)),
+        min_h_px=max(70,  int(min_h_px * 0.85))
+    )
+
+    boxes = big + mid
+
+    # dedup para que NO se repitan (0=1, 2=3)
+    boxes = deduplicar_boxes(boxes, thr=0.78)
+
+    return boxes
 
 # =============================
 #  App Streamlit
@@ -268,29 +208,24 @@ pil_img = Image.open(uploaded).convert("RGB")
 img_rgb = np.array(pil_img)
 img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
 
-st.sidebar.header("⚙️ Parámetros (ajustables)")
+st.sidebar.header("⚙️ Parámetros")
 
-min_area_ratio = st.sidebar.slider("Área mínima (%)", 0.1, 5.0, 1.0, 0.1) / 100.0
-max_area_ratio = st.sidebar.slider("Área máxima (%)", 10.0, 90.0, 80.0, 1.0) / 100.0
-min_w_ratio = st.sidebar.slider("Ancho mínimo (% ancho)", 5, 60, 12, 1) / 100.0
-min_h_ratio = st.sidebar.slider("Alto mínimo (% alto)", 2, 40, 3, 1) / 100.0
-close_kernel = st.sidebar.slider("Close kernel", 3, 25, 11, 2)
-close_iter = st.sidebar.slider("Close iteraciones", 1, 3, 1, 1)
+min_area_pct = st.sidebar.slider("Área mínima (%)", 0.05, 5.0, 0.20, 0.05)
+max_area_pct = st.sidebar.slider("Área máxima (%)", 10.0, 95.0, 90.0, 1.0)
 
-params_grandes = dict(
-    min_area_ratio=min_area_ratio,
-    max_area_ratio=max_area_ratio,
-    min_w_ratio=min_w_ratio,
-    min_h_ratio=min_h_ratio,
-    close_kernel=close_kernel,
-    close_iter=close_iter
+min_w_px = st.sidebar.slider("Ancho mínimo (px)", 80, 600, 140, 10)
+min_h_px = st.sidebar.slider("Alto mínimo (px)", 50, 500, 80, 10)
+
+boxes = detectar_todos_los_cuadros(
+    img_bgr,
+    min_area_pct=min_area_pct,
+    max_area_pct=max_area_pct,
+    min_w_px=min_w_px,
+    min_h_px=min_h_px
 )
 
-# ✅ aquí usamos: tu detector + refuerzo + merge
-boxes = detectar_todos_los_cuadros(img_bgr, params_grandes)
-
 if not boxes:
-    st.warning("No se detectaron cuadros. Ajusta los sliders.")
+    st.warning("No se detectaron cuadros. Baja Área mínima o baja Ancho/Alto mínimo.")
     st.stop()
 
 vis = dibujar_cuadros(img_bgr, boxes)
