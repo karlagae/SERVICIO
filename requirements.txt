@@ -4,3 +4,4 @@ numpy
 Pillow
 easyocr
 pip install pyspellchecker
+pip install pyspellchecker
