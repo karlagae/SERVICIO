@@ -99,11 +99,11 @@ def dedupe_boxes(boxes, iou_thr=0.85):
 # ==========================================================
 def detectar_cuadros_formulario(
     img_bgr,
-    min_area_ratio=0.002,     # 0.2% del área
+    min_area_ratio=0.001,     # 0.2% del área
     max_area_ratio=0.45,      # 45% del área (evita mega)
-    min_w_ratio=0.08,         # 8% del ancho
+    min_w_ratio=0.06,         # 8% del ancho
     min_h_ratio=0.03,         # 3% del alto
-    rectangularidad_min=0.55, # área/(w*h)
+    rectangularidad_min=0.45, # área/(w*h)
     close_kernel=5,
     close_iter=1,
     iou_thr=0.85,
