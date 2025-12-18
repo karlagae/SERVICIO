@@ -80,92 +80,55 @@ def autocorregir_texto(texto: str):
 #  Detección de recuadros
 # =============================
 
-def detectar_cuadros(img_bgr):
+def detectar_subcuadros(img_bgr):
     """
-    Detector híbrido:
-    A) Rectángulos cerrados (cajas)
-    B) Bloques de líneas horizontales (formularios)
-    Devuelve bounding boxes (x, y, w, h) sin duplicados.
+    Detecta recuadros cerrados (los cuadros exactos del formulario),
+    incluyendo cuadros internos dentro de secciones grandes.
+    Devuelve lista de (x,y,w,h).
     """
     H, W = img_bgr.shape[:2]
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-    # ---------- A) RECTÁNGULOS CERRADOS ----------
-    threshA = cv2.adaptiveThreshold(
-        ~gray, 255,
-        cv2.ADAPTIVE_THRESH_MEAN_C,
-        cv2.THRESH_BINARY,
-        15, -2
-    )
+    # binarización robusta (líneas negras -> blanco en mask)
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    horizontalA = threshA.copy()
-    hsize = max(10, W // 25)
-    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (hsize, 1))
-    horizontalA = cv2.erode(horizontalA, h_kernel)
-    horizontalA = cv2.dilate(horizontalA, h_kernel)
+    # Cerrar huecos pequeños en bordes para formar rectángulos "cerrados"
+    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)), iterations=2)
 
-    verticalA = threshA.copy()
-    vsize = max(10, H // 25)
-    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vsize))
-    verticalA = cv2.erode(verticalA, v_kernel)
-    verticalA = cv2.dilate(verticalA, v_kernel)
+    # Resaltar bordes rectangulares con morfología de líneas
+    horizontal = th.copy()
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(20, W // 40), 1))
+    horizontal = cv2.erode(horizontal, h_kernel, iterations=1)
+    horizontal = cv2.dilate(horizontal, h_kernel, iterations=2)
 
-    maskA = horizontalA + verticalA
-    contoursA, _ = cv2.findContours(maskA, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    vertical = th.copy()
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(20, H // 40)))
+    vertical = cv2.erode(vertical, v_kernel, iterations=1)
+    vertical = cv2.dilate(vertical, v_kernel, iterations=2)
 
-    boxesA = []
-    for cnt in contoursA:
+    mask = cv2.add(horizontal, vertical)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    boxes = []
+    for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
-        if w > 250 and h > 80:
-            boxesA.append((x, y, w, h))
 
-    # ---------- B) BLOQUES DE LÍNEAS (OBS/NOTA) ----------
-    _, threshB = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        # ✅ filtros para "tus" recuadros exactos:
+        # - evita micro-cuadritos de checkboxes
+        # - evita el recuadro gigante que engloba todo
+        if w < 60 and h < 60:
+            continue  # checkboxes
+        if w > 0.95 * W and h > 0.95 * H:
+            continue  # caja gigante
 
-    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (max(30, W // 15), 1))
-    horizontalB = cv2.morphologyEx(threshB, cv2.MORPH_OPEN, kernel_h)
+        # recuadros tipo panel (como Comunicación/Valores/Agudeza)
+        if w > 180 and h > 80:
+            boxes.append((x, y, w, h))
 
-    horizontalB = cv2.dilate(
-        horizontalB,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (1, 15)),
-        iterations=2
-    )
+    boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
+    return boxes
 
-    contoursB, _ = cv2.findContours(horizontalB, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    boxesB = []
-    for cnt in contoursB:
-        x, y, w, h = cv2.boundingRect(cnt)
-        if w > W * 0.4 and h > 60:
-            boxesB.append((x, y, w, h))
-
-    # ---------- UNIR + QUITAR DUPLICADOS ----------
-    def iou(a, b):
-        ax, ay, aw, ah = a
-        bx, by, bw, bh = b
-        x1 = max(ax, bx)
-        y1 = max(ay, by)
-        x2 = min(ax + aw, bx + bw)
-        y2 = min(ay + ah, by + bh)
-        inter = max(0, x2 - x1) * max(0, y2 - y1)
-        areaA = aw * ah
-        areaB = bw * bh
-        union = areaA + areaB - inter
-        return inter / union if union > 0 else 0
-
-    all_boxes = boxesA + boxesB
-    final = []
-
-    for b in sorted(all_boxes, key=lambda x: (x[1], x[0])):
-        dup = False
-        for f in final:
-            if iou(b, f) > 0.5:   # si se traslapan mucho, es el mismo bloque
-                dup = True
-                break
-        if not dup:
-            final.append(b)
-
-    return final
 
 
 def dibujar_cuadros(img_bgr, boxes):
