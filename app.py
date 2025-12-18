@@ -294,3 +294,162 @@ with col2:
             )
         else:
             st.caption("No detecté palabras para corregir (o ya estaban bien).")
+
+
+
+# =============================
+#  EXTRA: detectar checkboxes marcados dentro de un recorte (ej. CIRCULACIÓN)
+# =============================
+
+def _preprocess_for_boxes(crop_bgr):
+    """Binariza y limpia un recorte para detectar cuadritos de checkbox."""
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    # binarización robusta
+    th = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31, 9
+    )
+    # quita ruido pequeño
+    th = cv2.medianBlur(th, 3)
+    return th
+
+def detectar_checkboxes(crop_bgr):
+    """
+    Devuelve lista de checkboxes detectados como dict:
+    { 'x','y','w','h','fill' }  fill=porcentaje de tinta dentro
+    """
+    th = _preprocess_for_boxes(crop_bgr)
+
+    # Encontrar contornos "cuadritos"
+    contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    H, W = th.shape[:2]
+    boxes = []
+
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+
+        # filtros tamaño: checkbox típico (ajustable)
+        if w < 12 or h < 12:
+            continue
+        if w > int(W * 0.12) or h > int(H * 0.12):
+            continue
+
+        ar = w / float(h)
+        if ar < 0.7 or ar > 1.3:
+            continue
+
+        area = cv2.contourArea(cnt)
+        rect_area = w * h
+        if rect_area <= 0:
+            continue
+        # debe parecer "marco" (no mancha sólida)
+        if area / rect_area < 0.15:
+            continue
+
+        # medir tinta dentro del cuadrito (para saber si está tachado)
+        pad = max(1, int(min(w, h) * 0.18))
+        x0 = max(0, x + pad); y0 = max(0, y + pad)
+        x1 = min(W, x + w - pad); y1 = min(H, y + h - pad)
+        if x1 <= x0 or y1 <= y0:
+            continue
+
+        inner = th[y0:y1, x0:x1]
+        fill = float(np.mean(inner > 0))  # 0..1
+
+        boxes.append({"x": x, "y": y, "w": w, "h": h, "fill": fill})
+
+    # ordenar por lectura (arriba->abajo, izquierda->derecha)
+    boxes = sorted(boxes, key=lambda b: (b["y"], b["x"]))
+    return boxes
+
+def asignar_texto_a_checkbox(crop_bgr, checkbox, ocr_results, dx_ratio=0.02, dy_ratio=0.03):
+    """
+    Busca el texto más cercano A LA DERECHA del checkbox.
+    ocr_results: salida de EasyOCR con detail=1
+    """
+    H, W = crop_bgr.shape[:2]
+    x = checkbox["x"]; y = checkbox["y"]; w = checkbox["w"]; h = checkbox["h"]
+
+    # región de búsqueda: a la derecha del checkbox
+    x_min = x + w + int(W * dx_ratio)
+    x_max = min(W, x + w + int(W * 0.55))
+    y_min = max(0, y - int(H * dy_ratio))
+    y_max = min(H, y + h + int(H * dy_ratio))
+
+    best = None
+    best_score = 1e18
+
+    for (bbox, text, conf) in ocr_results:
+        # bbox -> rect
+        xs = [p[0] for p in bbox]; ys = [p[1] for p in bbox]
+        tx1, ty1, tx2, ty2 = min(xs), min(ys), max(xs), max(ys)
+
+        # centro del texto
+        cx = (tx1 + tx2) / 2.0
+        cy = (ty1 + ty2) / 2.0
+
+        # debe caer dentro de la "zona a la derecha"
+        if cx < x_min or cx > x_max or cy < y_min or cy > y_max:
+            continue
+
+        # score: distancia desde el checkbox
+        dx = cx - (x + w)
+        dy = cy - (y + h/2.0)
+        score = dx*dx + dy*dy
+
+        if score < best_score:
+            best_score = score
+            best = text
+
+    if best is None:
+        return None
+
+    best = re.sub(r"\s+", " ", best).strip()
+    if len(best) == 0:
+        return None
+    return best
+
+def resumen_checkboxes(crop_bgr, umbral_marcado=0.10, debug=False):
+    """
+    Devuelve:
+    - marcados: lista de textos detectados como marcados
+    - info_detalle: lista dict con checkbox + label
+    - img_debug: imagen con cajas coloreadas (si debug=True)
+    """
+    # OCR detallado para mapear texto a cada checkbox
+    ocr_det = ocr_easy_detail(crop_bgr)
+
+    checks = detectar_checkboxes(crop_bgr)
+
+    detalle = []
+    marcados = []
+
+    for ch in checks:
+        label = asignar_texto_a_checkbox(crop_bgr, ch, ocr_det)
+        marcado = (ch["fill"] >= umbral_marcado)
+
+        item = {
+            "label": label if label else "(sin texto detectado)",
+            "marcado": marcado,
+            "fill": round(ch["fill"], 3),
+            "x": ch["x"], "y": ch["y"], "w": ch["w"], "h": ch["h"]
+        }
+        detalle.append(item)
+        if marcado:
+            marcados.append(item["label"])
+
+    img_debug = None
+    if debug:
+        img_debug = crop_bgr.copy()
+        for it in detalle:
+            x,y,w,h = it["x"], it["y"], it["w"], it["h"]
+            color = (0,255,0) if it["marcado"] else (0,0,255)  # verde marcado / rojo no
+            cv2.rectangle(img_debug, (x,y), (x+w,y+h), color, 2)
+            cv2.putText(img_debug, f'{it["fill"]:.2f}', (x, max(12, y-5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+    return marcados, detalle, img_debug
+
