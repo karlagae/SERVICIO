@@ -1,6 +1,6 @@
 streamlit
-opencv-python-headless
-numpy
+opencv-python-headless==4.10.0.84
+numpy<2
 Pillow
 easyocr
 pyspellchecker
