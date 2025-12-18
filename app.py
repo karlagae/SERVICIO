@@ -6,34 +6,23 @@ import easyocr
 import re
 from spellchecker import SpellChecker
 
-# =============================
+# ==========================================================
 #  OCR con EasyOCR (cacheado)
-# =============================
+# ==========================================================
 @st.cache_resource
 def get_ocr_reader():
     return easyocr.Reader(['es'], gpu=False)
 
 reader = get_ocr_reader()
 
-def ocr_easy_detail(img_bgr):
-    """EasyOCR con cajas: lista de (bbox, text, conf)"""
+def ocr_easy(img_bgr):
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    return reader.readtext(img_rgb, detail=1)
+    results = reader.readtext(img_rgb, detail=0)
+    return " ".join(results).strip()
 
-def _bbox_to_xywh(bbox):
-    xs = [p[0] for p in bbox]
-    ys = [p[1] for p in bbox]
-    x1, y1, x2, y2 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
-    return x1, y1, x2 - x1, y2 - y1
-
-def _norm_text(s):
-    s = s.strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-# =============================
-#  Autocorrector (lo dejo por si lo quieres)
-# =============================
+# ==========================================================
+#  Autocorrector (diccionario tipo Word)
+# ==========================================================
 @st.cache_resource
 def get_spellchecker():
     return SpellChecker(language="es")
@@ -53,31 +42,79 @@ def autocorregir_texto(texto: str):
     def corregir_match(m):
         palabra = m.group(0)
         lower = palabra.lower()
+
         if lower in desconocidas:
             sugerida = spell.correction(lower) or lower
+
+            # Respeta capitalización
             if palabra.isupper():
                 sugerida = sugerida.upper()
             elif palabra[0].isupper():
                 sugerida = sugerida.capitalize()
+
             if sugerida.lower() != lower:
                 cambios.append((palabra, sugerida))
             return sugerida
+
         return palabra
 
     texto_corregido = re.sub(patron, corregir_match, texto)
     return texto_corregido, cambios
 
-# =============================
-#  1) Detectar checkboxes (cuadritos) - ROBUSTO para CIRCULACIÓN
-# =============================
-def detectar_checkboxes(crop_bgr):
-    """
-    Detecta cuadritos tipo checkbox dentro de un recorte (CIRCULACIÓN).
-    Devuelve lista de (x,y,w,h).
-    """
-    H, W = crop_bgr.shape[:2]
-    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+# ==========================================================
+#  Utilidades detección (IOU / containment / dedupe)
+# ==========================================================
+def iou(a, b):
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    x1 = max(ax, bx)
+    y1 = max(ay, by)
+    x2 = min(ax + aw, bx + bw)
+    y2 = min(ay + ah, by + bh)
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    union = aw*ah + bw*bh - inter
+    return inter / union if union > 0 else 0
 
+def contains(big, small, margin=2):
+    bx, by, bw, bh = big
+    sx, sy, sw, sh = small
+    return (sx >= bx + margin and sy >= by + margin and
+            sx + sw <= bx + bw - margin and sy + sh <= by + bh - margin)
+
+def dedupe_boxes(boxes, iou_thr=0.85):
+    boxes = sorted(boxes, key=lambda b: (b[2]*b[3]), reverse=True)  # grandes primero
+    out = []
+    for b in boxes:
+        if all(iou(b, o) < iou_thr for o in out):
+            out.append(b)
+    # orden visual
+    out = sorted(out, key=lambda b: (b[1], b[0]))
+    return out
+
+# ==========================================================
+#  Detección robusta de CUADROS/PANELES
+#  - encuentra rectángulos cerrados (incluye internos)
+#  - elimina mega-cuadros contenedores
+#  - elimina duplicados
+# ==========================================================
+def detectar_cuadros_formulario(
+    img_bgr,
+    min_area_ratio=0.002,     # 0.2% del área
+    max_area_ratio=0.45,      # 45% del área (evita mega)
+    min_w_ratio=0.08,         # 8% del ancho
+    min_h_ratio=0.03,         # 3% del alto
+    rectangularidad_min=0.55, # área/(w*h)
+    close_kernel=5,
+    close_iter=1,
+    iou_thr=0.85,
+    remover_contenedores=True,
+    contenedor_min_hijos=3,
+    contenedor_factor_area=1.8
+):
+    H, W = img_bgr.shape[:2]
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    # 1) binarización (líneas negras -> blanco)
     th = cv2.adaptiveThreshold(
         gray, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -85,192 +122,175 @@ def detectar_checkboxes(crop_bgr):
         31, 9
     )
 
-    # Une ligeramente bordes del cuadro para que el contorno salga estable
-    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3,3)), iterations=1)
-    th = cv2.morphologyEx(th, cv2.MORPH_OPEN,  cv2.getStructuringElement(cv2.MORPH_RECT, (3,3)), iterations=1)
-
-    contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    boxes = []
-    side_min = int(min(H, W) * 0.030)  # un poco más sensible
-    side_max = int(min(H, W) * 0.110)  # permite cuadros algo más grandes
-
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-        ar = w / float(h + 1e-6)
-
-        if ar < 0.80 or ar > 1.25:
-            continue
-        if w < side_min or h < side_min:
-            continue
-        if w > side_max or h > side_max:
-            continue
-
-        # opcional: evita falsos positivos enormes
-        if (w * h) > (side_max * side_max * 2.0):
-            continue
-
-        boxes.append((x, y, w, h))
-
-    # orden visual
-    boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
-    return boxes
-
-# =============================
-#  2) Detectar si está marcado (tinta dentro del checkbox)
-# =============================
-def checkbox_esta_marcado(crop_bgr, box, tinta_thresh=0.10):
-    """
-    tinta_thresh más bajo = más sensible.
-    """
-    x, y, w, h = box
-    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-
-    pad = max(2, int(min(w, h) * 0.20))  # interior
-    x2, y2 = x + w, y + h
-    xi1, yi1 = x + pad, y + pad
-    xi2, yi2 = x2 - pad, y2 - pad
-    if xi2 <= xi1 or yi2 <= yi1:
-        return False, 0.0
-
-    roi = gray[yi1:yi2, xi1:xi2]
-
-    roi_th = cv2.adaptiveThreshold(
-        roi, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        21, 7
+    # 2) cerrar pequeños huecos para "cerrar" rectángulos
+    k = max(3, int(close_kernel))
+    th = cv2.morphologyEx(
+        th, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)),
+        iterations=max(1, int(close_iter))
     )
 
-    ink = (roi_th > 0).mean()  # 0..1
-    return (ink >= tinta_thresh), float(ink)
+    # 3) contornos con jerarquía (incluye internos)
+    contours, hierarchy = cv2.findContours(th, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-# =============================
-#  3) Asignar etiqueta a checkbox (texto OCR cercano a la derecha)
-# =============================
-def asignar_texto_a_checkboxes(crop_bgr, checkbox_boxes):
-    ocr_items = ocr_easy_detail(crop_bgr)
+    img_area = float(H * W)
+    candidatos = []
 
-    textos = []
-    for bbox, txt, conf in ocr_items:
-        txt = _norm_text(txt)
-        if not txt:
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area <= 0:
             continue
-        x, y, w, h = _bbox_to_xywh(bbox)
-        textos.append({"x": x, "y": y, "w": w, "h": h, "txt": txt, "conf": conf})
 
-    asignaciones = []
-    for (x, y, w, h) in checkbox_boxes:
-        cy = y + h / 2.0
+        x, y, w, h = cv2.boundingRect(cnt)
+        area_ratio = (w * h) / img_area
 
-        cand = []
-        for t in textos:
-            tyc = t["y"] + t["h"] / 2.0
-            # misma fila aproximada
-            if abs(tyc - cy) <= max(10, h * 1.2):
-                # a la derecha del checkbox
-                if t["x"] >= x + w + 6:
-                    dx = t["x"] - (x + w)
-                    dy = abs(tyc - cy)
-                    cand.append((dx + 3 * dy, t))  # penaliza más el “salirse” de fila
+        # filtros básicos tamaño relativo
+        if area_ratio < min_area_ratio:
+            continue
+        if area_ratio > max_area_ratio:
+            continue
+        if w < W * min_w_ratio:
+            continue
+        if h < H * min_h_ratio:
+            continue
 
-        if cand:
-            cand.sort(key=lambda z: z[0])
-            etiqueta = cand[0][1]["txt"]
+        # aproximar a polígono para checar "rectángulo"
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+
+        # rectangularidad: qué tanto llena su bbox
+        rect_fill = area / float(w * h)
+        if rect_fill < rectangularidad_min:
+            continue
+
+        # preferir 4 lados convexos, pero aceptar algunos casos “casi rectángulo”
+        if len(approx) >= 4 and cv2.isContourConvex(approx):
+            candidatos.append((x, y, w, h))
         else:
-            etiqueta = ""
+            # si no es convexo/4, aún puede ser panel de tabla; lo aceptamos si es grande
+            if area_ratio >= (min_area_ratio * 2.0):
+                candidatos.append((x, y, w, h))
 
-        asignaciones.append({"box": (x, y, w, h), "label": etiqueta})
+    # 4) dedupe fuerte (evita 0/1 duplicados etc.)
+    candidatos = dedupe_boxes(candidatos, iou_thr=iou_thr)
 
-    return asignaciones
+    # 5) remover “contenedores” (el mega-cuadro que engloba muchos)
+    if remover_contenedores and len(candidatos) > 1:
+        areas = [b[2]*b[3] for b in candidatos]
+        # calculamos hijos por cada box
+        hijos_count = []
+        for i, b in enumerate(candidatos):
+            c = 0
+            for j, s in enumerate(candidatos):
+                if i != j and contains(b, s, margin=3):
+                    c += 1
+            hijos_count.append(c)
 
-# =============================
-#  4) Resumen final
-# =============================
-def resumen_checks_panel(crop_bgr, tinta_thresh=0.10):
-    checkbox_boxes = detectar_checkboxes(crop_bgr)
+        filtrados = []
+        for b, c in zip(candidatos, hijos_count):
+            b_area = b[2]*b[3]
+            # si contiene varios y es mucho más grande que el promedio, lo quitamos
+            if c >= contenedor_min_hijos:
+                # comparamos vs mediana aproximada (robusto)
+                med = np.median(areas) if len(areas) else b_area
+                if b_area > med * contenedor_factor_area:
+                    continue
+            filtrados.append(b)
 
-    estados = []
-    for b in checkbox_boxes:
-        marcado, ink = checkbox_esta_marcado(crop_bgr, b, tinta_thresh=tinta_thresh)
-        estados.append({"box": b, "checked": marcado, "ink": ink})
+        candidatos = filtrados
 
-    asign = asignar_texto_a_checkboxes(crop_bgr, checkbox_boxes)
-    box_to_label = {a["box"]: a["label"] for a in asign}
+        # dedupe final (por si quedó algo raro)
+        candidatos = dedupe_boxes(candidatos, iou_thr=iou_thr)
 
-    marcados = []
-    for e in estados:
-        if e["checked"]:
-            label = box_to_label.get(e["box"], "")
-            label = _norm_text(label) if label else "(sin etiqueta detectada)"
-            if label not in marcados:
-                marcados.append(label)
+    return candidatos
 
-    return {
-        "total_checkboxes": len(checkbox_boxes),
-        "marcados": marcados,
-        "debug_estados": estados,
-        "debug_labels": asign
-    }
-
-def dibujar_debug(crop_bgr, data):
-    vis = crop_bgr.copy()
-
-    # dibuja checkboxes: verde=marcado rojo=no
-    for i, e in enumerate(data["debug_estados"]):
-        x, y, w, h = e["box"]
-        color = (0, 255, 0) if e["checked"] else (0, 0, 255)
-        cv2.rectangle(vis, (x, y), (x + w, y + h), color, 2)
-        cv2.putText(vis, str(i), (x, y - 6 if y > 10 else y + 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-    # dibuja etiquetas OCR (azul) para ver qué leyó
-    for a in data["debug_labels"]:
-        x, y, w, h = a["box"]
-        if a["label"]:
-            cv2.putText(vis, a["label"][:18], (x + w + 6, y + int(h * 0.8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 0), 1)
-
+def dibujar_cuadros(img_bgr, boxes):
+    vis = img_bgr.copy()
+    for i, (x, y, w, h) in enumerate(boxes):
+        cv2.rectangle(vis, (x, y), (x+w, y+h), (0, 0, 255), 3)
+        cv2.putText(
+            vis, str(i), (x, max(25, y-10)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2
+        )
     return vis
 
-# =============================
-#  APP
-# =============================
-st.set_page_config(page_title="CIRCULACIÓN: checks -> resumen", layout="wide")
-st.title("✅ CIRCULACIÓN: detectar checks marcados y resumir")
+# ==========================================================
+#  App Streamlit
+# ==========================================================
+st.set_page_config(page_title="Detector de cuadros + OCR", layout="wide")
+st.title("🧾 Detector de cuadros + OCR + Autocorrector")
 
-uploaded = st.file_uploader("Sube SOLO el recorte del cuadro de CIRCULACIÓN (JPG/PNG)", type=["png", "jpg", "jpeg"])
+uploaded = st.file_uploader("Sube una imagen JPG/PNG", type=["png", "jpg", "jpeg"])
 if not uploaded:
-    st.info("👆 Sube el recorte para comenzar.")
+    st.info("👆 Sube una imagen para comenzar.")
     st.stop()
 
 pil_img = Image.open(uploaded).convert("RGB")
 img_rgb = np.array(pil_img)
-crop_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
 
-colA, colB = st.columns([1, 1])
+# Sidebar: parámetros (sin que tengas que “programar” cada vez)
+st.sidebar.header("⚙️ Detección (ajustable)")
+min_area_pct = st.sidebar.slider("Área mínima (%)", 0.05, 5.00, 0.20, 0.05)
+max_area_pct = st.sidebar.slider("Área máxima (%)", 5.00, 80.00, 45.00, 1.00)
+min_w_pct = st.sidebar.slider("Ancho mínimo (% del ancho)", 4, 60, 8, 1)
+min_h_pct = st.sidebar.slider("Alto mínimo (% del alto)", 2, 40, 3, 1)
+rect_fill = st.sidebar.slider("Rectangularidad mínima (relleno)", 0.30, 0.95, 0.55, 0.05)
+close_kernel = st.sidebar.slider("Close kernel", 3, 21, 5, 2)
+close_iter = st.sidebar.slider("Close iteraciones", 1, 4, 1, 1)
+iou_thr = st.sidebar.slider("Quitar duplicados (IOU)", 0.60, 0.95, 0.85, 0.01)
 
-with colA:
-    st.subheader("Recorte (entrada)")
-    st.image(img_rgb, use_container_width=True)
+st.sidebar.markdown("---")
+remover_cont = st.sidebar.checkbox("Quitar cuadros contenedores (mega-cuadro)", value=True)
+cont_hijos = st.sidebar.slider("Contenedor: mínimo #hijos", 2, 10, 3, 1)
+cont_factor = st.sidebar.slider("Contenedor: factor de área", 1.1, 3.0, 1.8, 0.1)
 
-with colB:
-    st.subheader("Parámetros")
-    tinta = st.slider("Sensibilidad de marcado (tinta dentro del checkbox)", 0.05, 0.25, 0.10, 0.01)
+boxes = detectar_cuadros_formulario(
+    img_bgr,
+    min_area_ratio=min_area_pct/100.0,
+    max_area_ratio=max_area_pct/100.0,
+    min_w_ratio=min_w_pct/100.0,
+    min_h_ratio=min_h_pct/100.0,
+    rectangularidad_min=rect_fill,
+    close_kernel=close_kernel,
+    close_iter=close_iter,
+    iou_thr=iou_thr,
+    remover_contenedores=remover_cont,
+    contenedor_min_hijos=cont_hijos,
+    contenedor_factor_area=cont_factor
+)
 
-    if st.button("Generar resumen"):
-        data = resumen_checks_panel(crop_bgr, tinta_thresh=tinta)
+if not boxes:
+    st.warning("No se detectaron cuadros con estos parámetros. Ajusta sliders en el sidebar.")
+    st.stop()
 
-        st.write(f"Checkboxes detectados: {data['total_checkboxes']}")
+vis = dibujar_cuadros(img_bgr, boxes)
+st.subheader("Imagen con cuadros detectados")
+st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), use_container_width=True)
 
-        if data["marcados"]:
-            st.success("✅ Marcados detectados:")
-            for m in data["marcados"]:
-                st.write(f"- {m}")
+idx = st.selectbox("Selecciona un cuadro", list(range(len(boxes))), format_func=lambda i: f"Cuadro {i}")
+x, y, w, h = boxes[idx]
+crop = img_bgr[y:y+h, x:x+w]
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader("Recorte")
+    st.image(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB), use_container_width=True)
+
+with col2:
+    st.subheader("OCR + Autocorrector")
+    texto_ocr = ocr_easy(crop)
+    st.text_area("1) OCR (crudo)", texto_ocr, height=180)
+
+    if st.checkbox("Aplicar autocorrector", value=True):
+        texto_ok, cambios = autocorregir_texto(texto_ocr)
+        st.text_area("2) Corregido", texto_ok, height=180)
+        if cambios:
+            st.caption(f"Cambios detectados: {len(cambios)}")
+            st.dataframe(
+                {"Original": [c[0] for c in cambios], "Sugerido": [c[1] for c in cambios]},
+                use_container_width=True
+            )
         else:
-            st.warning("No detecté checks marcados. Baja un poquito la sensibilidad (tinta).")
-
-        st.markdown("---")
-        st.subheader("Debug visual (verde=marcado, rojo=no)")
-        vis = dibujar_debug(crop_bgr, data)
-        st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), use_container_width=True)
+            st.caption("No detecté palabras para corregir (o ya estaban bien).")
