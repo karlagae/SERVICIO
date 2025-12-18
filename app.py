@@ -63,10 +63,10 @@ def autocorregir_texto(texto: str):
 # =============================
 def detectar_cuadros_grandes(
     img_bgr,
-    min_area_ratio=0.010,   # 1.0% del área de la hoja
-    max_area_ratio=0.30,    # 30% del área (para evitar el "mega cuadro")
-    min_w_ratio=0.18,       # 18% del ancho
-    min_h_ratio=0.06,       # 6% del alto
+    min_area_ratio=0.010,
+    max_area_ratio=0.30,
+    min_w_ratio=0.18,
+    min_h_ratio=0.06,
     close_kernel=7,
     close_iter=2
 ):
@@ -80,12 +80,10 @@ def detectar_cuadros_grandes(
         31, 9
     )
 
-    # líneas horizontales
     h_len = max(30, W // 25)
     h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))
     horiz = cv2.morphologyEx(th, cv2.MORPH_OPEN, h_kernel, iterations=1)
 
-    # líneas verticales
     v_len = max(30, H // 25)
     v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_len))
     vert = cv2.morphologyEx(th, cv2.MORPH_OPEN, v_kernel, iterations=1)
@@ -107,9 +105,7 @@ def detectar_cuadros_grandes(
 
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
-        area = w * h
-        area_ratio = area / img_area
-
+        area_ratio = (w * h) / img_area
         if area_ratio < min_area_ratio:
             continue
         if area_ratio > max_area_ratio:
@@ -118,31 +114,13 @@ def detectar_cuadros_grandes(
             continue
         if h < H * min_h_ratio:
             continue
-
         boxes.append((x, y, w, h))
 
     boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
-
-    def iou(a, b):
-        ax, ay, aw, ah = a
-        bx, by, bw, bh = b
-        x1 = max(ax, bx)
-        y1 = max(ay, by)
-        x2 = min(ax + aw, bx + bw)
-        y2 = min(ay + ah, by + bh)
-        inter = max(0, x2 - x1) * max(0, y2 - y1)
-        union = aw * ah + bw * bh - inter
-        return inter / union if union > 0 else 0
-
-    final = []
-    for b in boxes:
-        if all(iou(b, f) < 0.85 for f in final):
-            final.append(b)
-
-    return final
+    return boxes
 
 # =============================
-#  Split: dividir cuadros pegados (como tu "Cuadro 4")
+#  Split: dividir cuadros pegados
 # =============================
 def _split_por_valles_verticales(crop_bin, min_gap_px=18):
     col_sum = crop_bin.sum(axis=0) / 255.0
@@ -194,17 +172,42 @@ def dividir_cuadros_pegados(img_bgr, boxes, split_w_ratio=0.55, min_gap_px=18):
 
         xs = [0] + cuts + [w]
         for i in range(len(xs) - 1):
-            x0 = xs[i]
-            x1 = xs[i + 1]
+            x0, x1 = xs[i], xs[i + 1]
             seg_w = x1 - x0
-
             if seg_w < 0.12 * W:
                 continue
-
             out.append((x + x0, y, seg_w, h))
 
     out = sorted(out, key=lambda b: (b[1], b[0]))
     return out
+
+# =============================
+#  Deduplicar: elimina cuadros repetidos
+# =============================
+def deduplicar_boxes(boxes, iou_thr=0.65):
+    if not boxes:
+        return []
+
+    boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
+
+    def iou(a, b):
+        ax, ay, aw, ah = a
+        bx, by, bw, bh = b
+        x1 = max(ax, bx)
+        y1 = max(ay, by)
+        x2 = min(ax + aw, bx + bw)
+        y2 = min(ay + ah, by + bh)
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        union = aw * ah + bw * bh - inter
+        return inter / union if union > 0 else 0
+
+    final = []
+    for b in boxes:
+        if all(iou(b, f) < iou_thr for f in final):
+            final.append(b)
+
+    final = sorted(final, key=lambda b: (b[1], b[0]))
+    return final
 
 # =============================
 #  Subcuadros (opcional)
@@ -262,7 +265,7 @@ if modo == "Cuadros grandes (hoja completa)":
     max_area_ratio = st.sidebar.slider("Área máxima (%)", 5.0, 60.0, 30.0, 1.0) / 100.0
     min_w_ratio = st.sidebar.slider("Ancho mínimo (% del ancho)", 5, 60, 18, 1) / 100.0
     min_h_ratio = st.sidebar.slider("Alto mínimo (% del alto)", 2, 40, 6, 1) / 100.0
-    close_kernel = st.sidebar.slider("Close kernel (fuerza unión)", 3, 25, 7, 2)
+    close_kernel = st.sidebar.slider("Close kernel (fCierre)", 3, 25, 7, 2)
     close_iter = st.sidebar.slider("Close iteraciones", 1, 4, 2, 1)
 
     boxes = detectar_cuadros_grandes(
@@ -275,13 +278,16 @@ if modo == "Cuadros grandes (hoja completa)":
         close_iter=close_iter
     )
 
-    # ✅ Split automático (para cuadros que vienen "pegados")
     activar_split = st.sidebar.checkbox("Dividir cuadros pegados (split automático)", value=True)
-    split_w_ratio = st.sidebar.slider("Split: umbral de ancho (% del ancho)", 35, 90, 55, 1) / 100.0
+    split_w_ratio = st.sidebar.slider("Split: umbral ancho (% ancho)", 35, 90, 55, 1) / 100.0
     min_gap_px = st.sidebar.slider("Split: separación mínima (px)", 8, 60, 18, 1)
 
     if activar_split and boxes:
         boxes = dividir_cuadros_pegados(img_bgr, boxes, split_w_ratio=split_w_ratio, min_gap_px=min_gap_px)
+
+    # ✅ elimina duplicados (arregla Cuadro 0 y Cuadro 1 iguales)
+    iou_thr = st.sidebar.slider("Deduplicar: IoU umbral", 0.40, 0.90, 0.65, 0.01)
+    boxes = deduplicar_boxes(boxes, iou_thr=iou_thr)
 
 else:
     boxes = detectar_subcuadros(img_bgr)
