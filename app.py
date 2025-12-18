@@ -5,6 +5,7 @@ import streamlit as st
 import easyocr
 import re
 from spellchecker import SpellChecker
+from difflib import SequenceMatcher, get_close_matches
 
 # ==========================================================
 #  OCR con EasyOCR (cacheado)
@@ -22,8 +23,8 @@ def ocr_easy(img_bgr):
 
 def ocr_easy_detail(img_bgr):
     """
-    Devuelve lista: [(bbox, text, conf), ...]
-    bbox = [[x,y], [x,y], [x,y], [x,y]]
+    Devuelve lista: [ (bbox, text, conf), ... ]
+    bbox = [[x,y],[x,y],[x,y],[x,y]]
     """
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     return reader.readtext(img_rgb, detail=1)
@@ -100,7 +101,7 @@ def dedupe_boxes(boxes, iou_thr=0.85):
     return out
 
 # ==========================================================
-#  Detección robusta de CUADROS/PANELES (formulario completo)
+#  Detección robusta de CUADROS/PANELES
 # ==========================================================
 def detectar_cuadros_formulario(
     img_bgr,
@@ -119,7 +120,6 @@ def detectar_cuadros_formulario(
     H, W = img_bgr.shape[:2]
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-    # 1) binarización (líneas negras -> blanco)
     th = cv2.adaptiveThreshold(
         gray, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -127,7 +127,6 @@ def detectar_cuadros_formulario(
         31, 9
     )
 
-    # 2) cerrar pequeños huecos para "cerrar" rectángulos
     k = max(3, int(close_kernel))
     th = cv2.morphologyEx(
         th, cv2.MORPH_CLOSE,
@@ -135,8 +134,7 @@ def detectar_cuadros_formulario(
         iterations=max(1, int(close_iter))
     )
 
-    # 3) contornos con jerarquía (incluye internos)
-    contours, _ = cv2.findContours(th, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    contours, hierarchy = cv2.findContours(th, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
     img_area = float(H * W)
     candidatos = []
@@ -149,7 +147,6 @@ def detectar_cuadros_formulario(
         x, y, w, h = cv2.boundingRect(cnt)
         area_ratio = (w * h) / img_area
 
-        # filtros básicos tamaño relativo
         if area_ratio < min_area_ratio:
             continue
         if area_ratio > max_area_ratio:
@@ -159,11 +156,9 @@ def detectar_cuadros_formulario(
         if h < H * min_h_ratio:
             continue
 
-        # aproximar a polígono para checar "rectángulo"
         peri = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
 
-        # rectangularidad: qué tanto llena su bbox
         rect_fill = area / float(w * h)
         if rect_fill < rectangularidad_min:
             continue
@@ -174,13 +169,10 @@ def detectar_cuadros_formulario(
             if area_ratio >= (min_area_ratio * 2.0):
                 candidatos.append((x, y, w, h))
 
-    # 4) dedupe fuerte
     candidatos = dedupe_boxes(candidatos, iou_thr=iou_thr)
 
-    # 5) remover “contenedores” (mega-cuadro)
     if remover_contenedores and len(candidatos) > 1:
         areas = [b[2]*b[3] for b in candidatos]
-
         hijos_count = []
         for i, b in enumerate(candidatos):
             c = 0
@@ -213,8 +205,21 @@ def dibujar_cuadros(img_bgr, boxes):
     return vis
 
 # ==========================================================
-#  CHECKBOXES: detectar y resumir marcados en un recorte
+#  EXTRA: Checkboxes marcados dentro de un recorte (CIRCULACIÓN)
 # ==========================================================
+EXPECTED_CIRCULACION = [
+    "Sin compromiso", "Comprometida", "Especifique", "Cianosis", "Hormigueo", "Extremidades frías",
+    "Edema",
+    "N", "Negativo",
+    "1+ Leve", "2+ Moderado", "3+ Severo",
+    "Llenado capilar",
+    "Menor a 3 seg", "Mayor a 3 seg",
+    "Mucosas",
+    "Hidratadas", "Deshidratadas",
+    "Condiciones de la piel",
+    "Rosada", "Pálida", "Cianótica", "Ictérica", "Marmórea"
+]
+
 def _preprocess_for_boxes(crop_bgr):
     gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
     th = cv2.adaptiveThreshold(
@@ -227,48 +232,29 @@ def _preprocess_for_boxes(crop_bgr):
     return th
 
 def detectar_checkboxes(crop_bgr):
-    """
-    Detecta cuadritos tipo checkbox aunque estén tachados.
-    Devuelve: [{x,y,w,h,fill}, ...]
-    """
     th = _preprocess_for_boxes(crop_bgr)
-
-    # limpieza ligera para separar texto del cuadrito
-    th = cv2.morphologyEx(
-        th, cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
-        iterations=1
-    )
-
-    contours, _ = cv2.findContours(th, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     H, W = th.shape[:2]
-    out = []
+    boxes = []
 
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
 
-        if w < 10 or h < 10:
+        if w < 12 or h < 12:
             continue
-        if w > int(W * 0.18) or h > int(H * 0.18):
+        if w > int(W * 0.12) or h > int(H * 0.12):
             continue
 
         ar = w / float(h)
-        if ar < 0.75 or ar > 1.35:
-            continue
-
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.03 * peri, True)
-        if len(approx) != 4:
-            continue
-
-        rect_area = w * h
-        if rect_area <= 0:
+        if ar < 0.7 or ar > 1.3:
             continue
 
         area = cv2.contourArea(cnt)
-        fill_ratio_contour = area / rect_area
-        if fill_ratio_contour < 0.05 or fill_ratio_contour > 0.95:
+        rect_area = w * h
+        if rect_area <= 0:
+            continue
+        if area / rect_area < 0.15:
             continue
 
         pad = max(1, int(min(w, h) * 0.18))
@@ -280,73 +266,142 @@ def detectar_checkboxes(crop_bgr):
         inner = th[y0:y1, x0:x1]
         fill = float(np.mean(inner > 0))  # 0..1
 
-        out.append({"x": x, "y": y, "w": w, "h": h, "fill": fill})
+        boxes.append({"x": x, "y": y, "w": w, "h": h, "fill": fill})
 
-    out = sorted(out, key=lambda b: (b["y"], b["x"]))
+    boxes = sorted(boxes, key=lambda b: (b["y"], b["x"]))
+    return boxes
 
-    # dedupe por cercanía
-    dedup = []
-    for b in out:
-        keep = True
-        for d in dedup:
-            if abs(b["x"]-d["x"]) < 6 and abs(b["y"]-d["y"]) < 6 and abs(b["w"]-d["w"]) < 6 and abs(b["h"]-d["h"]) < 6:
-                if b["fill"] > d["fill"]:
-                    d.update(b)
-                keep = False
-                break
-        if keep:
-            dedup.append(b)
+def _ocr_rect(bbox):
+    xs = [p[0] for p in bbox]
+    ys = [p[1] for p in bbox]
+    return min(xs), min(ys), max(xs), max(ys)
 
-    return dedup
+def _clean_text(t: str) -> str:
+    t = re.sub(r"\s+", " ", t).strip()
+    t = t.replace("|", "").replace("’", "'")
+    return t
 
-def asignar_texto_a_checkbox(crop_bgr, checkbox, ocr_results, dx_ratio=0.02, dy_ratio=0.04):
+def _best_match_expected(label: str, expected_list, min_ratio=0.62):
+    if not label:
+        return None
+    lab = _clean_text(label)
+
+    # match rápido con difflib
+    candidates = get_close_matches(lab, expected_list, n=1, cutoff=min_ratio)
+    if candidates:
+        return candidates[0]
+
+    # si no, intenta ratio manual (por si acaso)
+    best = None
+    best_r = 0.0
+    for e in expected_list:
+        r = SequenceMatcher(None, lab.lower(), e.lower()).ratio()
+        if r > best_r:
+            best_r = r
+            best = e
+    return best if best_r >= min_ratio else lab
+
+def asignar_label_checkbox_bidir(crop_bgr, checkbox, ocr_results, dx_ratio=0.02, dy_ratio=0.05):
     """
-    Busca el texto más cercano A LA DERECHA del checkbox.
+    Busca el texto más cercano en la misma 'línea' del checkbox,
+    preferentemente a la IZQUIERDA, si no hay, a la DERECHA.
     """
     H, W = crop_bgr.shape[:2]
     x = checkbox["x"]; y = checkbox["y"]; w = checkbox["w"]; h = checkbox["h"]
+    cb_cx = x + w/2.0
+    cb_cy = y + h/2.0
 
-    x_min = x + w + int(W * dx_ratio)
-    x_max = min(W, x + w + int(W * 0.60))
-    y_min = max(0, y - int(H * dy_ratio))
-    y_max = min(H, y + h + int(H * dy_ratio))
+    # ventana vertical alrededor del checkbox
+    y_min = max(0, int(cb_cy - H * dy_ratio))
+    y_max = min(H, int(cb_cy + H * dy_ratio))
 
-    best = None
-    best_score = 1e18
+    # rangos horizontales izquierda y derecha
+    left_x_min  = max(0, int(cb_cx - W * 0.55))
+    left_x_max  = max(0, int(cb_cx - W * dx_ratio))
+    right_x_min = min(W, int(cb_cx + W * dx_ratio))
+    right_x_max = min(W, int(cb_cx + W * 0.55))
+
+    left_candidates = []
+    right_candidates = []
 
     for (bbox, text, conf) in ocr_results:
-        xs = [p[0] for p in bbox]; ys = [p[1] for p in bbox]
-        tx1, ty1, tx2, ty2 = min(xs), min(ys), max(xs), max(ys)
-
+        tx1, ty1, tx2, ty2 = _ocr_rect(bbox)
         cx = (tx1 + tx2) / 2.0
         cy = (ty1 + ty2) / 2.0
 
-        if cx < x_min or cx > x_max or cy < y_min or cy > y_max:
+        # misma banda vertical
+        if cy < y_min or cy > y_max:
             continue
 
-        dx = cx - (x + w)
-        dy = cy - (y + h/2.0)
-        score = dx*dx + dy*dy
+        t = _clean_text(text)
+        if not t:
+            continue
 
-        if score < best_score:
-            best_score = score
-            best = text
+        # a la izquierda
+        if cx >= left_x_min and cx <= left_x_max:
+            # distancia favorece lo más cercano al checkbox
+            dx = cb_cx - cx
+            dy = abs(cb_cy - cy)
+            score = dx*dx + (dy*dy * 0.6)
+            left_candidates.append((score, cx, t))
 
-    if best is None:
+        # a la derecha
+        if cx >= right_x_min and cx <= right_x_max:
+            dx = cx - cb_cx
+            dy = abs(cb_cy - cy)
+            score = dx*dx + (dy*dy * 0.6)
+            right_candidates.append((score, cx, t))
+
+    # preferimos izquierda (porque en tu formato la mayoría está a la izquierda)
+    left_candidates.sort(key=lambda z: z[0])
+    right_candidates.sort(key=lambda z: z[0])
+
+    chosen_side = None
+    if left_candidates:
+        chosen_side = "L"
+        base_score, base_cx, base_text = left_candidates[0]
+        pool = [c for c in left_candidates[:6]]
+    elif right_candidates:
+        chosen_side = "R"
+        base_score, base_cx, base_text = right_candidates[0]
+        pool = [c for c in right_candidates[:6]]
+    else:
         return None
 
-    best = re.sub(r"\s+", " ", best).strip()
-    if len(best) == 0:
-        return None
-    return best
+    # Unimos tokens cercanos en X (para formar "Menor a 3 seg", etc.)
+    # (solo del mismo lado)
+    pool_sorted = sorted(pool, key=lambda z: z[1])  # por cx
+    words = [p[2] for p in pool_sorted]
+
+    label = " ".join(words)
+    label = _clean_text(label)
+
+    # pequeña limpieza de duplicados (a veces OCR repite)
+    label = re.sub(r"\b(\w+)\s+\1\b", r"\1", label, flags=re.IGNORECASE)
+
+    # normalizamos contra catálogo esperado
+    label = _best_match_expected(label, EXPECTED_CIRCULACION, min_ratio=0.62)
+    return label
+
+def _grupo_por_x(crop_bgr, checkbox):
+    """Agrupa por columna aproximada (heurístico) para que el resumen salga ordenado."""
+    H, W = crop_bgr.shape[:2]
+    cx = checkbox["x"] + checkbox["w"]/2.0
+    x_ratio = cx / float(W)
+
+    # Estos cortes funcionan bien para tu recorte de CIRCULACIÓN
+    if x_ratio < 0.28:
+        return "Estado"
+    elif x_ratio < 0.43:
+        return "Edema"
+    elif x_ratio < 0.62:
+        return "Llenado capilar"
+    elif x_ratio < 0.78:
+        return "Mucosas"
+    else:
+        return "Condiciones de la piel"
 
 def resumen_checkboxes(crop_bgr, umbral_marcado=0.10, debug=False):
-    """
-    Devuelve:
-    - marcados: lista de labels marcados
-    - detalle: lista dict con label, fill, marcado, coords
-    - img_debug: imagen con cajas (si debug)
-    """
     ocr_det = ocr_easy_detail(crop_bgr)
     checks = detectar_checkboxes(crop_bgr)
 
@@ -354,30 +409,40 @@ def resumen_checkboxes(crop_bgr, umbral_marcado=0.10, debug=False):
     marcados = []
 
     for ch in checks:
-        label = asignar_texto_a_checkbox(crop_bgr, ch, ocr_det)
+        label = asignar_label_checkbox_bidir(crop_bgr, ch, ocr_det)
         marcado = (ch["fill"] >= umbral_marcado)
 
+        grupo = _grupo_por_x(crop_bgr, ch)
+
         item = {
+            "grupo": grupo,
             "label": label if label else "(sin texto detectado)",
             "marcado": marcado,
             "fill": round(ch["fill"], 3),
             "x": ch["x"], "y": ch["y"], "w": ch["w"], "h": ch["h"]
         }
         detalle.append(item)
-        if marcado:
-            marcados.append(item["label"])
+        if marcado and label:
+            marcados.append((grupo, label))
+
+    # resumen agrupado
+    resumen = {}
+    for g, lab in marcados:
+        resumen.setdefault(g, [])
+        if lab not in resumen[g]:
+            resumen[g].append(lab)
 
     img_debug = None
     if debug:
         img_debug = crop_bgr.copy()
         for it in detalle:
             x,y,w,h = it["x"], it["y"], it["w"], it["h"]
-            color = (0,255,0) if it["marcado"] else (0,0,255)
+            color = (0,255,0) if it["marcado"] else (0,0,255)  # verde marcado / rojo no
             cv2.rectangle(img_debug, (x,y), (x+w,y+h), color, 2)
             cv2.putText(img_debug, f'{it["fill"]:.2f}', (x, max(12, y-5)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
-    return marcados, detalle, img_debug
+    return resumen, detalle, img_debug
 
 # ==========================================================
 #  App Streamlit
@@ -394,7 +459,6 @@ pil_img = Image.open(uploaded).convert("RGB")
 img_rgb = np.array(pil_img)
 img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
 
-# Sidebar: parámetros
 st.sidebar.header("⚙️ Detección (ajustable)")
 min_area_pct = st.sidebar.slider("Área mínima (%)", 0.05, 5.00, 0.20, 0.05)
 max_area_pct = st.sidebar.slider("Área máxima (%)", 5.00, 80.00, 45.00, 1.00)
@@ -461,27 +525,34 @@ with col2:
             st.caption("No detecté palabras para corregir (o ya estaban bien).")
 
 st.markdown("---")
+
+# ==========================================================
+#  BLOQUE NUEVO: Resumen de checkboxes
+# ==========================================================
 st.subheader("✅ Resumen de checkboxes (para cuadros tipo CIRCULACIÓN)")
 
-umbral = st.slider("Sensibilidad de marcado (tinta dentro del checkbox)", 0.01, 0.35, 0.10, 0.01)
+umbral = st.slider("Sensibilidad de marcado (tinta dentro del checkbox)", 0.03, 0.50, 0.10, 0.01)
 
 c1, c2 = st.columns([1, 1])
-
 with c1:
-    if st.button("Generar resumen"):
-        marcados, detalle, _ = resumen_checkboxes(crop, umbral_marcado=umbral, debug=False)
-        st.markdown("### Marcados detectados")
-        if marcados:
-            st.write("• " + " • ".join(marcados))
-        else:
-            st.warning("No detecté checkboxes marcados. Prueba bajar el umbral a 0.06–0.08.")
-
-        st.markdown("### Detalle (para depurar)")
-        st.dataframe(detalle, use_container_width=True)
-
+    btn_resumen = st.button("Generar resumen")
 with c2:
-    if st.button("Ver debug (checkboxes)"):
-        marcados, detalle, img_dbg = resumen_checkboxes(crop, umbral_marcado=umbral, debug=True)
-        st.markdown("### Debug: verde=marcado / rojo=no")
-        st.image(cv2.cvtColor(img_dbg, cv2.COLOR_BGR2RGB), use_container_width=True)
-        st.caption("Tip: si te faltan checkboxes (ej. 'Sin compromiso' o 'Rosada'), baja el umbral un poco (0.06–0.08).")
+    btn_debug = st.button("Ver debug (checkboxes)")
+
+if btn_resumen or btn_debug:
+    resumen, detalle, img_debug = resumen_checkboxes(crop, umbral_marcado=umbral, debug=btn_debug)
+
+    st.subheader("Marcados detectados (por sección)")
+    if not resumen:
+        st.warning("No detecté checkboxes marcados con este umbral. Baja un poco el umbral.")
+    else:
+        for g in ["Estado", "Edema", "Llenado capilar", "Mucosas", "Condiciones de la piel"]:
+            if g in resumen:
+                st.markdown(f"**{g}:** " + ", ".join(resumen[g]))
+
+    st.subheader("Detalle (para depurar)")
+    st.dataframe(detalle, use_container_width=True)
+
+    if btn_debug and img_debug is not None:
+        st.markdown("**Debug: verde=marcado / rojo=no**")
+        st.image(cv2.cvtColor(img_debug, cv2.COLOR_BGR2RGB), use_container_width=True)
