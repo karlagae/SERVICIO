@@ -20,6 +20,11 @@ def ocr_easy(img_bgr):
     results = reader.readtext(img_rgb, detail=0)
     return " ".join(results).strip()
 
+
+
+def ocr_easy_detail(img_bgr):
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    return reader.readtext(img_rgb, detail=1)  # (bbox, text, conf)
 # ==========================================================
 #  Autocorrector (diccionario tipo Word)
 # ==========================================================
@@ -295,6 +300,37 @@ with col2:
         else:
             st.caption("No detecté palabras para corregir (o ya estaban bien).")
 
+    st.markdown("---")
+    st.subheader("✅ Resumen de checkboxes (para cuadros tipo CIRCULACIÓN)")
+
+    umbral = st.slider(
+        "Sensibilidad de marcado (tinta dentro del checkbox)",
+        0.02, 0.40, 0.10, 0.01
+    )
+
+    colA, colB = st.columns([1, 1])
+
+    with colA:
+        if st.button("Generar resumen"):
+            marcados, detalle, _ = resumen_checkboxes(crop, umbral_marcado=umbral, debug=False)
+
+            st.markdown("### Marcados detectados")
+            if marcados:
+                st.write("• " + "\n• ".join(marcados))
+            else:
+                st.info("No detecté casillas marcadas con ese umbral. Prueba subir/bajar el slider.")
+
+            st.markdown("### Detalle (para depurar)")
+            st.dataframe(detalle, use_container_width=True)
+
+    with colB:
+        if st.button("Ver debug (checkboxes)"):
+            _, _, img_debug = resumen_checkboxes(crop, umbral_marcado=umbral, debug=True)
+            if img_debug is not None:
+                st.markdown("### Debug: verde=marcado / rojo=no")
+                st.image(cv2.cvtColor(img_debug, cv2.COLOR_BGR2RGB), use_container_width=True)
+            else:
+                st.info("No pude generar debug en este recorte.")
 
 
 # =============================
