@@ -11,11 +11,11 @@ from spellchecker import SpellChecker
 # =============================
 @st.cache_resource
 def get_ocr_reader():
-    return easyocr.Reader(['es'], gpu=False)
+    return easyocr.Reader(["es"], gpu=False)
 
 reader = get_ocr_reader()
 
-def ocr_easy(img_bgr):
+def ocr_easy(img_bgr: np.ndarray) -> str:
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     results = reader.readtext(img_rgb, detail=0)
     return " ".join(results).strip()
@@ -59,16 +59,63 @@ def autocorregir_texto(texto: str):
     return texto_corregido, cambios
 
 # =============================
+#  Utilidades: IoU / Contención
+# =============================
+def _iou(a, b):
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    x1 = max(ax, bx); y1 = max(ay, by)
+    x2 = min(ax + aw, bx + bw); y2 = min(ay + ah, by + bh)
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0 else 0.0
+
+def _contiene(a, b, margen=6):
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    return (
+        ax <= bx + margen and ay <= by + margen and
+        ax + aw >= bx + bw - margen and ay + ah >= by + bh - margen
+    )
+
+def quitar_padres(boxes):
+    """
+    Elimina cajas "padre" que contienen otras (evita duplicados tipo borde externo/interno).
+    """
+    if not boxes:
+        return []
+    boxes = sorted(boxes, key=lambda b: b[2] * b[3])  # pequeñas primero
+    keep = []
+    for b in boxes:
+        if any(_contiene(b, k) for k in keep):
+            continue
+        keep.append(b)
+    return sorted(keep, key=lambda b: (b[1], b[0]))
+
+def deduplicar_boxes(boxes, iou_thr=0.55):
+    """
+    Deduplicado final por IoU.
+    """
+    if not boxes:
+        return []
+    boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)  # grandes primero
+    final = []
+    for b in boxes:
+        if all(_iou(b, f) < iou_thr for f in final):
+            final.append(b)
+    return sorted(final, key=lambda b: (b[1], b[0]))
+
+# =============================
 #  Detección: CUADROS GRANDES (hoja completa)
 # =============================
 def detectar_cuadros_grandes(
     img_bgr,
-    min_area_ratio=0.010,
-    max_area_ratio=0.35,
-    min_w_ratio=0.18,
-    min_h_ratio=0.06,
-    close_kernel=7,
-    close_iter=2
+    min_area_ratio=0.003,   # 0.3% (mejor para Adobe Scan)
+    max_area_ratio=0.80,
+    min_w_ratio=0.12,
+    min_h_ratio=0.03,
+    close_kernel=11,
+    close_iter=3
 ):
     H, W = img_bgr.shape[:2]
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -80,19 +127,18 @@ def detectar_cuadros_grandes(
         31, 9
     )
 
-    # líneas horizontales
+    # Detectar líneas horizontales y verticales
     h_len = max(30, W // 25)
-    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))
-    horiz = cv2.morphologyEx(th, cv2.MORPH_OPEN, h_kernel, iterations=1)
-
-    # líneas verticales
     v_len = max(30, H // 25)
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))
     v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_len))
-    vert = cv2.morphologyEx(th, cv2.MORPH_OPEN, v_kernel, iterations=1)
+
+    horiz = cv2.morphologyEx(th, cv2.MORPH_OPEN, h_kernel, iterations=1)
+    vert  = cv2.morphologyEx(th, cv2.MORPH_OPEN, v_kernel, iterations=1)
 
     mask = cv2.add(horiz, vert)
 
-    # cerrar huecos para formar rectángulos
+    # Cerrar huecos para formar rectángulos
     k = max(3, int(close_kernel))
     mask = cv2.morphologyEx(
         mask,
@@ -124,9 +170,9 @@ def detectar_cuadros_grandes(
     return sorted(boxes, key=lambda b: (b[1], b[0]))
 
 # =============================
-#  Split V2: dividir cuadros pegados (mejor para formularios)
+#  Split V2: partir cuadros anchos (cuando engloba 2-3 paneles)
 # =============================
-def dividir_cuadros_pegados(img_bgr, boxes, split_w_ratio=0.40, min_gap_px=14):
+def dividir_cuadros_pegados(img_bgr, boxes, split_w_ratio=0.35, min_gap_px=12):
     H, W = img_bgr.shape[:2]
     out = []
 
@@ -138,7 +184,7 @@ def dividir_cuadros_pegados(img_bgr, boxes, split_w_ratio=0.40, min_gap_px=14):
         31, 9
     )
 
-    # máscara de líneas
+    # máscara de líneas (más robusta para tablas)
     h_len = max(30, W // 25)
     v_len = max(30, H // 25)
     h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))
@@ -152,8 +198,9 @@ def dividir_cuadros_pegados(img_bgr, boxes, split_w_ratio=0.40, min_gap_px=14):
             out.append((x, y, w, h))
             continue
 
-        crop = line_mask[y:y+h, x:x+w]
+        crop = line_mask[y:y + h, x:x + w]
 
+        # proyección vertical
         col = crop.sum(axis=0) / 255.0
         if col.max() > 0:
             col = col / col.max()
@@ -163,6 +210,7 @@ def dividir_cuadros_pegados(img_bgr, boxes, split_w_ratio=0.40, min_gap_px=14):
         kernel = np.ones(k) / k
         col_s = np.convolve(col, kernel, mode="same")
 
+        # valles (zonas "vacías" donde cortar)
         valle = col_s < 0.12
 
         cuts = []
@@ -188,53 +236,11 @@ def dividir_cuadros_pegados(img_bgr, boxes, split_w_ratio=0.40, min_gap_px=14):
         for i in range(len(xs) - 1):
             x0, x1 = xs[i], xs[i + 1]
             seg_w = x1 - x0
-
-            if seg_w < 0.10 * W:
+            if seg_w < 0.10 * W:  # evita pedacitos
                 continue
-
             out.append((x + x0, y, seg_w, h))
 
     return sorted(out, key=lambda b: (b[1], b[0]))
-
-# =============================
-#  Quitar "padres" + deduplicar (arregla 0=1, 2=3, etc.)
-# =============================
-def _iou(a, b):
-    ax, ay, aw, ah = a
-    bx, by, bw, bh = b
-    x1 = max(ax, bx); y1 = max(ay, by)
-    x2 = min(ax + aw, bx + bw); y2 = min(ay + ah, by + bh)
-    inter = max(0, x2-x1) * max(0, y2-y1)
-    union = aw*ah + bw*bh - inter
-    return inter/union if union > 0 else 0
-
-def _contiene(a, b, margen=6):
-    ax, ay, aw, ah = a
-    bx, by, bw, bh = b
-    return (ax <= bx + margen and ay <= by + margen and
-            ax + aw >= bx + bw - margen and ay + ah >= by + bh - margen)
-
-def quitar_padres(boxes):
-    if not boxes:
-        return []
-    boxes = sorted(boxes, key=lambda b: b[2]*b[3])  # pequeñas primero
-    keep = []
-    for b in boxes:
-        # si b contiene a alguna ya guardada => b es padre => se descarta
-        if any(_contiene(b, k) for k in keep):
-            continue
-        keep.append(b)
-    return sorted(keep, key=lambda b: (b[1], b[0]))
-
-def deduplicar_boxes(boxes, iou_thr=0.55):
-    if not boxes:
-        return []
-    boxes = sorted(boxes, key=lambda b: b[2]*b[3], reverse=True)  # grandes primero
-    final = []
-    for b in boxes:
-        if all(_iou(b, f) < iou_thr for f in final):
-            final.append(b)
-    return sorted(final, key=lambda b: (b[1], b[0]))
 
 # =============================
 #  Dibujo
@@ -243,8 +249,10 @@ def dibujar_cuadros(img_bgr, boxes):
     vis = img_bgr.copy()
     for i, (x, y, w, h) in enumerate(boxes):
         cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 0, 255), 3)
-        cv2.putText(vis, str(i), (x, max(20, y - 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+        cv2.putText(
+            vis, str(i), (x, max(20, y - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2
+        )
     return vis
 
 # =============================
@@ -262,22 +270,22 @@ pil_img = Image.open(uploaded).convert("RGB")
 img_rgb = np.array(pil_img)
 img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
 
-st.sidebar.header("⚙️ Parámetros")
+st.sidebar.header("⚙️ Parámetros (ajustables)")
 
-min_area_ratio = st.sidebar.slider("Área mínima (%)", 0.1, 5.0, 1.0, 0.1) / 100.0
-max_area_ratio = st.sidebar.slider("Área máxima (%)", 5.0, 70.0, 35.0, 1.0) / 100.0
-min_w_ratio = st.sidebar.slider("Ancho mínimo (% ancho)", 5, 60, 18, 1) / 100.0
-min_h_ratio = st.sidebar.slider("Alto mínimo (% alto)", 2, 40, 6, 1) / 100.0
-close_kernel = st.sidebar.slider("Close kernel", 3, 25, 7, 2)
-close_iter = st.sidebar.slider("Close iteraciones", 1, 4, 2, 1)
+min_area_ratio = st.sidebar.slider("Área mínima (%)", 0.1, 5.0, 0.3, 0.1) / 100.0
+max_area_ratio = st.sidebar.slider("Área máxima (%)", 5.0, 90.0, 80.0, 1.0) / 100.0
+min_w_ratio = st.sidebar.slider("Ancho mínimo (% ancho)", 5, 60, 12, 1) / 100.0
+min_h_ratio = st.sidebar.slider("Alto mínimo (% alto)", 2, 40, 3, 1) / 100.0
+close_kernel = st.sidebar.slider("Close kernel", 3, 25, 11, 2)
+close_iter = st.sidebar.slider("Close iteraciones", 1, 5, 3, 1)
 
 activar_split = st.sidebar.checkbox("Dividir cuadros pegados", value=True)
-split_w_ratio = st.sidebar.slider("Split: umbral ancho (% ancho)", 25, 90, 40, 1) / 100.0
-min_gap_px = st.sidebar.slider("Split: separación mínima (px)", 8, 60, 14, 1)
+split_w_ratio = st.sidebar.slider("Split: umbral ancho (% ancho)", 25, 90, 35, 1) / 100.0
+min_gap_px = st.sidebar.slider("Split: separación mínima (px)", 8, 60, 12, 1)
 
 iou_thr = st.sidebar.slider("Deduplicar: IoU umbral", 0.40, 0.90, 0.55, 0.01)
 
-# 1) detectar
+# ---- Pipeline de detección ----
 boxes = detectar_cuadros_grandes(
     img_bgr,
     min_area_ratio=min_area_ratio,
@@ -288,29 +296,52 @@ boxes = detectar_cuadros_grandes(
     close_iter=close_iter
 )
 
-# 2) split
 if activar_split and boxes:
     boxes = dividir_cuadros_pegados(img_bgr, boxes, split_w_ratio=split_w_ratio, min_gap_px=min_gap_px)
 
-# 3) quitar padres
 boxes = quitar_padres(boxes)
-
-# 4) deduplicar final
 boxes = deduplicar_boxes(boxes, iou_thr=iou_thr)
 
+# ---- Fallback automático si no detecta nada ----
 if not boxes:
-    st.warning("No se detectaron cuadros con estos parámetros. Ajusta sliders en el sidebar.")
-    st.stop()
+    st.warning(
+        "No se detectaron cuadros con estos parámetros. "
+        "Probando configuración más flexible automáticamente..."
+    )
 
+    boxes = detectar_cuadros_grandes(
+        img_bgr,
+        min_area_ratio=0.002,   # 0.2%
+        max_area_ratio=0.90,
+        min_w_ratio=0.10,
+        min_h_ratio=0.025,
+        close_kernel=13,
+        close_iter=3
+    )
+    boxes = dividir_cuadros_pegados(img_bgr, boxes, split_w_ratio=0.35, min_gap_px=12)
+    boxes = quitar_padres(boxes)
+    boxes = deduplicar_boxes(boxes, iou_thr=0.55)
+
+    if not boxes:
+        st.error("No fue posible detectar cuadros automáticamente en esta imagen.")
+        st.stop()
+
+# ---- UI ----
 vis = dibujar_cuadros(img_bgr, boxes)
 st.subheader("Imagen con cuadros detectados")
 st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), use_container_width=True)
 
-idx = st.selectbox("Selecciona un cuadro", list(range(len(boxes))), format_func=lambda i: f"Cuadro {i}")
+idx = st.selectbox(
+    "Selecciona un cuadro",
+    list(range(len(boxes))),
+    format_func=lambda i: f"Cuadro {i}"
+)
+
 x, y, w, h = boxes[idx]
 crop = img_bgr[y:y + h, x:x + w]
 
 col1, col2 = st.columns(2)
+
 with col1:
     st.subheader("Recorte")
     st.image(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB), use_container_width=True)
@@ -318,13 +349,19 @@ with col1:
 with col2:
     st.subheader("OCR + Autocorrector")
     texto_ocr = ocr_easy(crop)
-    st.text_area("OCR (crudo)", texto_ocr, height=160)
+    st.text_area("OCR (crudo)", texto_ocr, height=180)
 
-    if st.checkbox("Aplicar autocorrector", value=True):
+    usar_autocorrector = st.checkbox("Aplicar autocorrector", value=True)
+    if usar_autocorrector:
         texto_ok, cambios = autocorregir_texto(texto_ocr)
-        st.text_area("Corregido", texto_ok, height=160)
+        st.text_area("Corregido", texto_ok, height=180)
+
         if cambios:
+            st.caption(f"Cambios detectados: {len(cambios)}")
             st.dataframe(
-                {"Original": [c[0] for c in cambios], "Sugerido": [c[1] for c in cambios]},
+                {"Original": [c[0] for c in cambios],
+                 "Sugerido": [c[1] for c in cambios]},
                 use_container_width=True
             )
+        else:
+            st.info("No detecté palabras para corregir (o ya estaban bien).")
