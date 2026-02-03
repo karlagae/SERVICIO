@@ -1,3 +1,8 @@
+import pandas as pd
+from io import BytesIO
+from datetime import datetime
+from docx import Document
+
 import cv2
 import numpy as np
 from PIL import Image
