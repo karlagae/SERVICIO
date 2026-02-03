@@ -20,6 +20,7 @@ except ModuleNotFoundError:
     DOCX_AVAILABLE = False
 
 
+
 # ==========================================================
 #  OCR con EasyOCR (cacheado)
 # ==========================================================
