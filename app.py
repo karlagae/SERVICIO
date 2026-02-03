@@ -555,6 +555,12 @@ with c2:
 if btn_resumen or btn_debug:
     resumen, detalle, img_debug = resumen_checkboxes(crop, umbral_marcado=umbral, debug=btn_debug)
 
+        # ✅ Guardar para exportación
+    st.session_state["last_resumen"] = resumen
+    st.session_state["last_detalle"] = detalle
+    st.session_state["last_umbral"] = umbral
+
+
     st.subheader("Marcados detectados (por sección)")
     if not resumen:
         st.warning("No detecté checkboxes marcados con este umbral. Baja un poco el umbral.")
@@ -569,3 +575,147 @@ if btn_resumen or btn_debug:
     if btn_debug and img_debug is not None:
         st.markdown("**Debug: verde=marcado / rojo=no**")
         st.image(cv2.cvtColor(img_debug, cv2.COLOR_BGR2RGB), use_container_width=True)
+
+
+
+
+
+
+# ==========================================================
+#  EXPORTACIÓN A EXCEL / WORD (lo extraído)
+# ==========================================================
+st.markdown("---")
+st.subheader("📦 Exportar lo extraído (Excel / Word)")
+
+def build_excel_bytes(texto_raw, texto_corr, cambios, resumen, detalle, cuadro_idx):
+    bio = BytesIO()
+
+    # DataFrames
+    df_ocr = pd.DataFrame([{
+        "Cuadro": cuadro_idx,
+        "OCR_Crudo": texto_raw,
+        "OCR_Corregido": texto_corr
+    }])
+
+    df_cambios = pd.DataFrame(cambios, columns=["Original", "Sugerido"]) if cambios else pd.DataFrame(columns=["Original", "Sugerido"])
+
+    # Resumen en filas
+    rows_res = []
+    if isinstance(resumen, dict) and resumen:
+        for k, vals in resumen.items():
+            rows_res.append({"Seccion": k, "Marcados": ", ".join(vals)})
+    df_resumen = pd.DataFrame(rows_res) if rows_res else pd.DataFrame(columns=["Seccion", "Marcados"])
+
+    df_detalle = pd.DataFrame(detalle) if isinstance(detalle, list) and detalle else pd.DataFrame()
+
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df_ocr.to_excel(writer, index=False, sheet_name="OCR")
+        df_cambios.to_excel(writer, index=False, sheet_name="Cambios_Autocorrect")
+        df_resumen.to_excel(writer, index=False, sheet_name="Resumen_Checkboxes")
+        df_detalle.to_excel(writer, index=False, sheet_name="Detalle_Checkboxes")
+
+    bio.seek(0)
+    return bio.getvalue()
+
+def build_word_bytes(texto_raw, texto_corr, cambios, resumen, detalle, cuadro_idx):
+    doc = Document()
+    doc.add_heading("Resultados de extracción (OCR)", level=1)
+    doc.add_paragraph(f"Cuadro seleccionado: {cuadro_idx}")
+    doc.add_paragraph(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    doc.add_heading("OCR crudo", level=2)
+    doc.add_paragraph(texto_raw if texto_raw else "")
+
+    doc.add_heading("OCR corregido", level=2)
+    doc.add_paragraph(texto_corr if texto_corr else "")
+
+    doc.add_heading("Cambios del autocorrector", level=2)
+    if cambios:
+        table = doc.add_table(rows=1, cols=2)
+        hdr = table.rows[0].cells
+        hdr[0].text = "Original"
+        hdr[1].text = "Sugerido"
+        for o, s in cambios:
+            row = table.add_row().cells
+            row[0].text = str(o)
+            row[1].text = str(s)
+    else:
+        doc.add_paragraph("Sin cambios detectados.")
+
+    doc.add_heading("Resumen de checkboxes", level=2)
+    if isinstance(resumen, dict) and resumen:
+        for sec in ["Estado", "Edema", "Llenado capilar", "Mucosas", "Condiciones de la piel"]:
+            if sec in resumen:
+                doc.add_paragraph(f"{sec}: {', '.join(resumen[sec])}")
+    else:
+        doc.add_paragraph("No hay resumen generado (presiona 'Generar resumen' primero).")
+
+    doc.add_heading("Detalle de checkboxes (tabla)", level=2)
+    if isinstance(detalle, list) and detalle:
+        # Elegimos columnas típicas si existen
+        cols = ["grupo", "label", "marcado", "fill", "x", "y", "w", "h"]
+        cols_exist = [c for c in cols if c in detalle[0].keys()]
+
+        table = doc.add_table(rows=1, cols=len(cols_exist))
+        hdr = table.rows[0].cells
+        for j, c in enumerate(cols_exist):
+            hdr[j].text = c
+
+        for it in detalle:
+            row = table.add_row().cells
+            for j, c in enumerate(cols_exist):
+                row[j].text = str(it.get(c, ""))
+    else:
+        doc.add_paragraph("No hay detalle generado (presiona 'Generar resumen' primero).")
+
+    bio = BytesIO()
+    doc.save(bio)
+    bio.seek(0)
+    return bio.getvalue()
+
+# Obtener lo último generado (si no has presionado “Generar resumen”, quedará vacío)
+last_resumen = st.session_state.get("last_resumen", {})
+last_detalle = st.session_state.get("last_detalle", [])
+
+formato = st.radio("Formato de exportación", ["Excel (.xlsx)", "Word (.docx)"], horizontal=True)
+
+# Nombre sugerido
+ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+nombre_base = f"extraccion_cuadro_{idx}_{ts}"
+
+if formato == "Excel (.xlsx)":
+    data = build_excel_bytes(
+        texto_raw=texto_ocr,
+        texto_corr=texto_final,
+        cambios=cambios_final,
+        resumen=last_resumen,
+        detalle=last_detalle,
+        cuadro_idx=idx
+    )
+    st.download_button(
+        label="⬇️ Descargar Excel",
+        data=data,
+        file_name=f"{nombre_base}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+else:
+    data = build_word_bytes(
+        texto_raw=texto_ocr,
+        texto_corr=texto_final,
+        cambios=cambios_final,
+        resumen=last_resumen,
+        detalle=last_detalle,
+        cuadro_idx=idx
+    )
+    st.download_button(
+        label="⬇️ Descargar Word",
+        data=data,
+        file_name=f"{nombre_base}.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+
+st.caption("Tip: para que el Word/Excel incluya checkboxes, primero selecciona el cuadro y presiona “Generar resumen”.")
+
+
+
