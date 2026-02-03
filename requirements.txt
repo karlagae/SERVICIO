@@ -1,8 +1,9 @@
 streamlit
 opencv-python-headless
 numpy
-Pillow
+pillow
 easyocr
 pyspellchecker
-torch
-torchvision
+pandas
+openpyxl
+python-docx
