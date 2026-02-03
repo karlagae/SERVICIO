@@ -1,16 +1,24 @@
-import pandas as pd
-from io import BytesIO
-from datetime import datetime
-from docx import Document
-
+import streamlit as st
 import cv2
 import numpy as np
 from PIL import Image
-import streamlit as st
 import easyocr
 import re
 from spellchecker import SpellChecker
 from difflib import SequenceMatcher, get_close_matches
+import pandas as pd
+from io import BytesIO
+from datetime import datetime
+
+# -----------------------------
+# Word opcional (no debe tronar)
+# -----------------------------
+try:
+    from docx import Document
+    DOCX_AVAILABLE = True
+except ModuleNotFoundError:
+    DOCX_AVAILABLE = False
+
 
 # ==========================================================
 #  OCR con EasyOCR (cacheado)
@@ -110,11 +118,11 @@ def dedupe_boxes(boxes, iou_thr=0.85):
 # ==========================================================
 def detectar_cuadros_formulario(
     img_bgr,
-    min_area_ratio=0.002,     # 0.2% del área
-    max_area_ratio=0.45,      # 45% del área (evita mega)
-    min_w_ratio=0.08,         # 8% del ancho
-    min_h_ratio=0.03,         # 3% del alto
-    rectangularidad_min=0.55, # área/(w*h)
+    min_area_ratio=0.002,
+    max_area_ratio=0.45,
+    min_w_ratio=0.08,
+    min_h_ratio=0.03,
+    rectangularidad_min=0.55,
     close_kernel=5,
     close_iter=1,
     iou_thr=0.85,
@@ -209,8 +217,9 @@ def dibujar_cuadros(img_bgr, boxes):
         )
     return vis
 
+
 # ==========================================================
-#  EXTRA: Checkboxes marcados dentro de un recorte (CIRCULACIÓN)
+#  Checkboxes (tu lógica, intacta)
 # ==========================================================
 EXPECTED_CIRCULACION = [
     "Sin compromiso", "Comprometida", "Especifique", "Cianosis", "Hormigueo", "Extremidades frías",
@@ -291,12 +300,10 @@ def _best_match_expected(label: str, expected_list, min_ratio=0.62):
         return None
     lab = _clean_text(label)
 
-    # match rápido con difflib
     candidates = get_close_matches(lab, expected_list, n=1, cutoff=min_ratio)
     if candidates:
         return candidates[0]
 
-    # si no, intenta ratio manual (por si acaso)
     best = None
     best_r = 0.0
     for e in expected_list:
@@ -307,20 +314,14 @@ def _best_match_expected(label: str, expected_list, min_ratio=0.62):
     return best if best_r >= min_ratio else lab
 
 def asignar_label_checkbox_bidir(crop_bgr, checkbox, ocr_results, dx_ratio=0.02, dy_ratio=0.05):
-    """
-    Busca el texto más cercano en la misma 'línea' del checkbox,
-    preferentemente a la IZQUIERDA, si no hay, a la DERECHA.
-    """
     H, W = crop_bgr.shape[:2]
     x = checkbox["x"]; y = checkbox["y"]; w = checkbox["w"]; h = checkbox["h"]
     cb_cx = x + w/2.0
     cb_cy = y + h/2.0
 
-    # ventana vertical alrededor del checkbox
     y_min = max(0, int(cb_cy - H * dy_ratio))
     y_max = min(H, int(cb_cy + H * dy_ratio))
 
-    # rangos horizontales izquierda y derecha
     left_x_min  = max(0, int(cb_cx - W * 0.55))
     left_x_max  = max(0, int(cb_cx - W * dx_ratio))
     right_x_min = min(W, int(cb_cx + W * dx_ratio))
@@ -334,7 +335,6 @@ def asignar_label_checkbox_bidir(crop_bgr, checkbox, ocr_results, dx_ratio=0.02,
         cx = (tx1 + tx2) / 2.0
         cy = (ty1 + ty2) / 2.0
 
-        # misma banda vertical
         if cy < y_min or cy > y_max:
             continue
 
@@ -342,59 +342,42 @@ def asignar_label_checkbox_bidir(crop_bgr, checkbox, ocr_results, dx_ratio=0.02,
         if not t:
             continue
 
-        # a la izquierda
         if cx >= left_x_min and cx <= left_x_max:
-            # distancia favorece lo más cercano al checkbox
             dx = cb_cx - cx
             dy = abs(cb_cy - cy)
             score = dx*dx + (dy*dy * 0.6)
             left_candidates.append((score, cx, t))
 
-        # a la derecha
         if cx >= right_x_min and cx <= right_x_max:
             dx = cx - cb_cx
             dy = abs(cb_cy - cy)
             score = dx*dx + (dy*dy * 0.6)
             right_candidates.append((score, cx, t))
 
-    # preferimos izquierda (porque en tu formato la mayoría está a la izquierda)
     left_candidates.sort(key=lambda z: z[0])
     right_candidates.sort(key=lambda z: z[0])
 
-    chosen_side = None
     if left_candidates:
-        chosen_side = "L"
-        base_score, base_cx, base_text = left_candidates[0]
         pool = [c for c in left_candidates[:6]]
     elif right_candidates:
-        chosen_side = "R"
-        base_score, base_cx, base_text = right_candidates[0]
         pool = [c for c in right_candidates[:6]]
     else:
         return None
 
-    # Unimos tokens cercanos en X (para formar "Menor a 3 seg", etc.)
-    # (solo del mismo lado)
-    pool_sorted = sorted(pool, key=lambda z: z[1])  # por cx
+    pool_sorted = sorted(pool, key=lambda z: z[1])
     words = [p[2] for p in pool_sorted]
 
     label = " ".join(words)
     label = _clean_text(label)
-
-    # pequeña limpieza de duplicados (a veces OCR repite)
     label = re.sub(r"\b(\w+)\s+\1\b", r"\1", label, flags=re.IGNORECASE)
-
-    # normalizamos contra catálogo esperado
     label = _best_match_expected(label, EXPECTED_CIRCULACION, min_ratio=0.62)
     return label
 
 def _grupo_por_x(crop_bgr, checkbox):
-    """Agrupa por columna aproximada (heurístico) para que el resumen salga ordenado."""
     H, W = crop_bgr.shape[:2]
     cx = checkbox["x"] + checkbox["w"]/2.0
     x_ratio = cx / float(W)
 
-    # Estos cortes funcionan bien para tu recorte de CIRCULACIÓN
     if x_ratio < 0.28:
         return "Estado"
     elif x_ratio < 0.43:
@@ -416,7 +399,6 @@ def resumen_checkboxes(crop_bgr, umbral_marcado=0.10, debug=False):
     for ch in checks:
         label = asignar_label_checkbox_bidir(crop_bgr, ch, ocr_det)
         marcado = (ch["fill"] >= umbral_marcado)
-
         grupo = _grupo_por_x(crop_bgr, ch)
 
         item = {
@@ -430,7 +412,6 @@ def resumen_checkboxes(crop_bgr, umbral_marcado=0.10, debug=False):
         if marcado and label:
             marcados.append((grupo, label))
 
-    # resumen agrupado
     resumen = {}
     for g, lab in marcados:
         resumen.setdefault(g, [])
@@ -442,18 +423,59 @@ def resumen_checkboxes(crop_bgr, umbral_marcado=0.10, debug=False):
         img_debug = crop_bgr.copy()
         for it in detalle:
             x,y,w,h = it["x"], it["y"], it["w"], it["h"]
-            color = (0,255,0) if it["marcado"] else (0,0,255)  # verde marcado / rojo no
+            color = (0,255,0) if it["marcado"] else (0,0,255)
             cv2.rectangle(img_debug, (x,y), (x+w,y+h), color, 2)
             cv2.putText(img_debug, f'{it["fill"]:.2f}', (x, max(12, y-5)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
     return resumen, detalle, img_debug
 
+
+# ==========================================================
+#  Exportadores
+# ==========================================================
+def build_excel_bytes(df_all, df_cambios, df_resumen_cb, df_detalle_cb):
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df_all.to_excel(writer, index=False, sheet_name="OCR_TODOS")
+        df_cambios.to_excel(writer, index=False, sheet_name="Cambios_Autocorrect")
+        df_resumen_cb.to_excel(writer, index=False, sheet_name="Resumen_Checkboxes")
+        df_detalle_cb.to_excel(writer, index=False, sheet_name="Detalle_Checkboxes")
+    bio.seek(0)
+    return bio.getvalue()
+
+def build_word_bytes(df_all, df_resumen_cb):
+    doc = Document()
+    doc.add_heading("Resultados de extracción (OCR)", level=1)
+    doc.add_paragraph(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    doc.add_heading("OCR por cuadro", level=2)
+    for _, r in df_all.iterrows():
+        doc.add_heading(f"Cuadro {int(r['Cuadro'])}", level=3)
+        doc.add_paragraph("OCR (crudo):")
+        doc.add_paragraph(str(r.get("OCR_Crudo", "")))
+        doc.add_paragraph("OCR (final):")
+        doc.add_paragraph(str(r.get("OCR_Final", "")))
+        doc.add_paragraph("")
+
+    doc.add_heading("Resumen de checkboxes", level=2)
+    if df_resumen_cb.empty:
+        doc.add_paragraph("Sin resumen de checkboxes (no se activó o no se detectó).")
+    else:
+        for _, r in df_resumen_cb.iterrows():
+            doc.add_paragraph(f"Cuadro {int(r['Cuadro'])} | {r['Seccion']}: {r['Marcados']}")
+
+    bio = BytesIO()
+    doc.save(bio)
+    bio.seek(0)
+    return bio.getvalue()
+
+
 # ==========================================================
 #  App Streamlit
 # ==========================================================
 st.set_page_config(page_title="Detector de cuadros + OCR", layout="wide")
-st.title("🧾 Detector de cuadros + OCR + Autocorrector")
+st.title("🧾 Detector de cuadros + OCR + Autocorrector (TODOS los cuadros)")
 
 uploaded = st.file_uploader("Sube una imagen JPG/PNG", type=["png", "jpg", "jpeg"])
 if not uploaded:
@@ -479,6 +501,12 @@ remover_cont = st.sidebar.checkbox("Quitar cuadros contenedores (mega-cuadro)", 
 cont_hijos = st.sidebar.slider("Contenedor: mínimo #hijos", 2, 10, 3, 1)
 cont_factor = st.sidebar.slider("Contenedor: factor de área", 1.1, 3.0, 1.8, 0.1)
 
+st.sidebar.markdown("---")
+aplicar_autocorrect = st.sidebar.checkbox("Aplicar autocorrector a TODOS", value=True)
+hacer_checkboxes = st.sidebar.checkbox("Intentar resumen de checkboxes en TODOS", value=True)
+umbral_cb = st.sidebar.slider("Umbral checkboxes (tinta)", 0.03, 0.50, 0.10, 0.01)
+mostrar_debug_cb = st.sidebar.checkbox("Mostrar debug de checkboxes", value=False)
+
 boxes = detectar_cuadros_formulario(
     img_bgr,
     min_area_ratio=min_area_pct/100.0,
@@ -502,220 +530,117 @@ vis = dibujar_cuadros(img_bgr, boxes)
 st.subheader("Imagen con cuadros detectados")
 st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), use_container_width=True)
 
-idx = st.selectbox("Selecciona un cuadro", list(range(len(boxes))), format_func=lambda i: f"Cuadro {i}")
-x, y, w, h = boxes[idx]
-crop = img_bgr[y:y+h, x:x+w]
+st.markdown("---")
+st.subheader("▶️ Extraer TODO (Cuadro 0, 1, 2, …)")
 
-col1, col2 = st.columns(2)
+btn = st.button("🚀 Extraer todos los cuadros")
+if not btn:
+    st.info("Presiona el botón para extraer todos los cuadros y habilitar la descarga del Excel/Word.")
+    st.stop()
 
-with col1:
-    st.subheader("Recorte")
-    st.image(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB), use_container_width=True)
+progress = st.progress(0)
+status = st.empty()
 
-with col2:
-    st.subheader("OCR + Autocorrector")
+rows_all = []
+rows_cambios = []
+rows_resumen_cb = []
+rows_detalle_cb = []
+
+for i, (x, y, w, h) in enumerate(boxes):
+    status.write(f"Procesando Cuadro {i}...")
+    crop = img_bgr[y:y+h, x:x+w]
+
+    # OCR
     texto_ocr = ocr_easy(crop)
-    st.text_area("1) OCR (crudo)", texto_ocr, height=180)
-
-# ✅ Variables “exportables”
     texto_final = texto_ocr
     cambios_final = []
-    autocorrect_on = st.checkbox("Aplicar autocorrector", value=True)
 
-    if autocorrect_on:
+    if aplicar_autocorrect:
         texto_ok, cambios = autocorregir_texto(texto_ocr)
         texto_final = texto_ok
-        cambios_final = cambios
+        cambios_final = cambios or []
 
-        st.text_area("2) Corregido", texto_ok, height=180)
-        if cambios:
-            st.caption(f"Cambios detectados: {len(cambios)}")
-            st.dataframe(
-                {"Original": [c[0] for c in cambios], "Sugerido": [c[1] for c in cambios]},
-                use_container_width=True
-            )
-        else:
-            st.caption("No detecté palabras para corregir (o ya estaban bien).")
-    else:
-        st.caption("Autocorrector desactivado (se exportará OCR crudo).")
+    rows_all.append({
+        "Cuadro": i,
+        "x": x, "y": y, "w": w, "h": h,
+        "OCR_Crudo": texto_ocr,
+        "OCR_Final": texto_final
+    })
 
-# ==========================================================
-#  BLOQUE NUEVO: Resumen de checkboxes
-# ==========================================================
-st.subheader("✅ Resumen de checkboxes (para cuadros tipo CIRCULACIÓN)")
+    for (orig, sug) in cambios_final:
+        rows_cambios.append({
+            "Cuadro": i,
+            "Original": orig,
+            "Sugerido": sug
+        })
 
-umbral = st.slider("Sensibilidad de marcado (tinta dentro del checkbox)", 0.03, 0.50, 0.10, 0.01)
+    # Checkboxes (opcional, puede no aplicar a todos los cuadros)
+    if hacer_checkboxes:
+        try:
+            resumen, detalle, img_debug = resumen_checkboxes(crop, umbral_marcado=umbral_cb, debug=mostrar_debug_cb)
+        except Exception:
+            resumen, detalle, img_debug = {}, [], None
 
-c1, c2 = st.columns([1, 1])
-with c1:
-    btn_resumen = st.button("Generar resumen")
-with c2:
-    btn_debug = st.button("Ver debug (checkboxes)")
+        if isinstance(resumen, dict) and resumen:
+            for k, vals in resumen.items():
+                rows_resumen_cb.append({
+                    "Cuadro": i,
+                    "Seccion": k,
+                    "Marcados": ", ".join(vals)
+                })
 
-if btn_resumen or btn_debug:
-    resumen, detalle, img_debug = resumen_checkboxes(crop, umbral_marcado=umbral, debug=btn_debug)
+        if isinstance(detalle, list) and detalle:
+            for it in detalle:
+                rows_detalle_cb.append({"Cuadro": i, **it})
 
-        # ✅ Guardar para exportación
-    st.session_state["last_resumen"] = resumen
-    st.session_state["last_detalle"] = detalle
-    st.session_state["last_umbral"] = umbral
+    # Mostrar resultados en pantalla (como pediste: cuadro 0, abajo cuadro 1, etc.)
+    with st.expander(f"Cuadro {i} — ver resultado", expanded=(i == 0)):
+        st.image(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB), use_container_width=True)
+        st.text_area(f"Cuadro {i} | OCR (crudo)", texto_ocr, height=140)
+        st.text_area(f"Cuadro {i} | OCR (final)", texto_final, height=140)
 
+        if aplicar_autocorrect and cambios_final:
+            st.caption(f"Cambios autocorrector: {len(cambios_final)}")
+            st.dataframe(pd.DataFrame(cambios_final, columns=["Original", "Sugerido"]), use_container_width=True)
 
-    st.subheader("Marcados detectados (por sección)")
-    if not resumen:
-        st.warning("No detecté checkboxes marcados con este umbral. Baja un poco el umbral.")
-    else:
-        for g in ["Estado", "Edema", "Llenado capilar", "Mucosas", "Condiciones de la piel"]:
-            if g in resumen:
-                st.markdown(f"**{g}:** " + ", ".join(resumen[g]))
+        if hacer_checkboxes:
+            if rows_resumen_cb:
+                # mostramos solo lo del cuadro actual
+                df_tmp = pd.DataFrame([r for r in rows_resumen_cb if r["Cuadro"] == i])
+                if not df_tmp.empty:
+                    st.caption("Resumen checkboxes (si aplica)")
+                    st.dataframe(df_tmp[["Seccion", "Marcados"]], use_container_width=True)
 
-    st.subheader("Detalle (para depurar)")
-    st.dataframe(detalle, use_container_width=True)
+    progress.progress(int(((i+1) / len(boxes)) * 100))
 
-    if btn_debug and img_debug is not None:
-        st.markdown("**Debug: verde=marcado / rojo=no**")
-        st.image(cv2.cvtColor(img_debug, cv2.COLOR_BGR2RGB), use_container_width=True)
+status.success("✅ Listo. Ya puedes descargar el archivo.")
 
+df_all = pd.DataFrame(rows_all)
+df_cambios = pd.DataFrame(rows_cambios) if rows_cambios else pd.DataFrame(columns=["Cuadro", "Original", "Sugerido"])
+df_resumen_cb = pd.DataFrame(rows_resumen_cb) if rows_resumen_cb else pd.DataFrame(columns=["Cuadro", "Seccion", "Marcados"])
+df_detalle_cb = pd.DataFrame(rows_detalle_cb) if rows_detalle_cb else pd.DataFrame(columns=["Cuadro", "grupo", "label", "marcado", "fill", "x", "y", "w", "h"])
 
-
-
-
-
-# ==========================================================
-#  EXPORTACIÓN A EXCEL / WORD (lo extraído)
-# ==========================================================
 st.markdown("---")
-st.subheader("📦 Exportar lo extraído (Excel / Word)")
+st.subheader("📦 Descargar resultados")
 
-def build_excel_bytes(texto_raw, texto_corr, cambios, resumen, detalle, cuadro_idx):
-    bio = BytesIO()
-
-    # DataFrames
-    df_ocr = pd.DataFrame([{
-        "Cuadro": cuadro_idx,
-        "OCR_Crudo": texto_raw,
-        "OCR_Corregido": texto_corr
-    }])
-
-    df_cambios = pd.DataFrame(cambios, columns=["Original", "Sugerido"]) if cambios else pd.DataFrame(columns=["Original", "Sugerido"])
-
-    # Resumen en filas
-    rows_res = []
-    if isinstance(resumen, dict) and resumen:
-        for k, vals in resumen.items():
-            rows_res.append({"Seccion": k, "Marcados": ", ".join(vals)})
-    df_resumen = pd.DataFrame(rows_res) if rows_res else pd.DataFrame(columns=["Seccion", "Marcados"])
-
-    df_detalle = pd.DataFrame(detalle) if isinstance(detalle, list) and detalle else pd.DataFrame()
-
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        df_ocr.to_excel(writer, index=False, sheet_name="OCR")
-        df_cambios.to_excel(writer, index=False, sheet_name="Cambios_Autocorrect")
-        df_resumen.to_excel(writer, index=False, sheet_name="Resumen_Checkboxes")
-        df_detalle.to_excel(writer, index=False, sheet_name="Detalle_Checkboxes")
-
-    bio.seek(0)
-    return bio.getvalue()
-
-def build_word_bytes(texto_raw, texto_corr, cambios, resumen, detalle, cuadro_idx):
-    doc = Document()
-    doc.add_heading("Resultados de extracción (OCR)", level=1)
-    doc.add_paragraph(f"Cuadro seleccionado: {cuadro_idx}")
-    doc.add_paragraph(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-    doc.add_heading("OCR crudo", level=2)
-    doc.add_paragraph(texto_raw if texto_raw else "")
-
-    doc.add_heading("OCR corregido", level=2)
-    doc.add_paragraph(texto_corr if texto_corr else "")
-
-    doc.add_heading("Cambios del autocorrector", level=2)
-    if cambios:
-        table = doc.add_table(rows=1, cols=2)
-        hdr = table.rows[0].cells
-        hdr[0].text = "Original"
-        hdr[1].text = "Sugerido"
-        for o, s in cambios:
-            row = table.add_row().cells
-            row[0].text = str(o)
-            row[1].text = str(s)
-    else:
-        doc.add_paragraph("Sin cambios detectados.")
-
-    doc.add_heading("Resumen de checkboxes", level=2)
-    if isinstance(resumen, dict) and resumen:
-        for sec in ["Estado", "Edema", "Llenado capilar", "Mucosas", "Condiciones de la piel"]:
-            if sec in resumen:
-                doc.add_paragraph(f"{sec}: {', '.join(resumen[sec])}")
-    else:
-        doc.add_paragraph("No hay resumen generado (presiona 'Generar resumen' primero).")
-
-    doc.add_heading("Detalle de checkboxes (tabla)", level=2)
-    if isinstance(detalle, list) and detalle:
-        # Elegimos columnas típicas si existen
-        cols = ["grupo", "label", "marcado", "fill", "x", "y", "w", "h"]
-        cols_exist = [c for c in cols if c in detalle[0].keys()]
-
-        table = doc.add_table(rows=1, cols=len(cols_exist))
-        hdr = table.rows[0].cells
-        for j, c in enumerate(cols_exist):
-            hdr[j].text = c
-
-        for it in detalle:
-            row = table.add_row().cells
-            for j, c in enumerate(cols_exist):
-                row[j].text = str(it.get(c, ""))
-    else:
-        doc.add_paragraph("No hay detalle generado (presiona 'Generar resumen' primero).")
-
-    bio = BytesIO()
-    doc.save(bio)
-    bio.seek(0)
-    return bio.getvalue()
-
-# Obtener lo último generado (si no has presionado “Generar resumen”, quedará vacío)
-last_resumen = st.session_state.get("last_resumen", {})
-last_detalle = st.session_state.get("last_detalle", [])
-
-formato = st.radio("Formato de exportación", ["Excel (.xlsx)", "Word (.docx)"], horizontal=True)
-
-# Nombre sugerido
 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-nombre_base = f"extraccion_cuadro_{idx}_{ts}"
+base = f"extraccion_todos_{ts}"
 
-if formato == "Excel (.xlsx)":
-    data = build_excel_bytes(
-        texto_raw=texto_ocr,
-        texto_corr=texto_final,
-        cambios=cambios_final,
-        resumen=last_resumen,
-        detalle=last_detalle,
-        cuadro_idx=idx
-    )
-    st.download_button(
-        label="⬇️ Descargar Excel",
-        data=data,
-        file_name=f"{nombre_base}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+excel_bytes = build_excel_bytes(df_all, df_cambios, df_resumen_cb, df_detalle_cb)
+st.download_button(
+    "⬇️ Descargar Excel (TODO)",
+    data=excel_bytes,
+    file_name=f"{base}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
 
-else:
-    data = build_word_bytes(
-        texto_raw=texto_ocr,
-        texto_corr=texto_final,
-        cambios=cambios_final,
-        resumen=last_resumen,
-        detalle=last_detalle,
-        cuadro_idx=idx
-    )
+if DOCX_AVAILABLE:
+    docx_bytes = build_word_bytes(df_all, df_resumen_cb)
     st.download_button(
-        label="⬇️ Descargar Word",
-        data=data,
-        file_name=f"{nombre_base}.docx",
+        "⬇️ Descargar Word (TODO)",
+        data=docx_bytes,
+        file_name=f"{base}.docx",
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
-
-st.caption("Tip: para que el Word/Excel incluya checkboxes, primero selecciona el cuadro y presiona “Generar resumen”.")
-
-
-
+else:
+    st.info("Word desactivado: falta instalar 'python-docx'. (Excel sí funciona).")
