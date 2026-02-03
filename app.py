@@ -517,8 +517,16 @@ with col2:
     texto_ocr = ocr_easy(crop)
     st.text_area("1) OCR (crudo)", texto_ocr, height=180)
 
-    if st.checkbox("Aplicar autocorrector", value=True):
+# ✅ Variables “exportables”
+    texto_final = texto_ocr
+    cambios_final = []
+    autocorrect_on = st.checkbox("Aplicar autocorrector", value=True)
+
+    if autocorrect_on:
         texto_ok, cambios = autocorregir_texto(texto_ocr)
+        texto_final = texto_ok
+        cambios_final = cambios
+
         st.text_area("2) Corregido", texto_ok, height=180)
         if cambios:
             st.caption(f"Cambios detectados: {len(cambios)}")
@@ -528,8 +536,8 @@ with col2:
             )
         else:
             st.caption("No detecté palabras para corregir (o ya estaban bien).")
-
-st.markdown("---")
+    else:
+        st.caption("Autocorrector desactivado (se exportará OCR crudo).")
 
 # ==========================================================
 #  BLOQUE NUEVO: Resumen de checkboxes
