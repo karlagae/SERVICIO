@@ -37,7 +37,8 @@ if "bitacora" not in st.session_state:
 # ==========================================================
 # 🔐 LOGIN
 # ==========================================================
-st.title("🔐 Acceso al sistema")
+def login_view():
+    st.title("🔐 Inicio de sesión")
 
     username = st.text_input("Usuario")
     password = st.text_input("Contraseña", type="password")
