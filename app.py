@@ -196,3 +196,7 @@ if uploaded:
         if cambios:
             st.write("Correcciones:")
             st.dataframe(pd.DataFrame(cambios, columns=["Original", "Sugerido"]))
+
+
+
+pagina = st.sidebar.radio("Navegación", ["OCR", "Resultados"])
