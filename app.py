@@ -174,7 +174,9 @@ def autocorregir_texto(texto: str):
 # UI
 # ==========================================================
 st.set_page_config(page_title="Detector de cuadros + OCR", layout="wide")
-st.title("🧾 Detector de cuadros + OCR")
+
+if st.session_state.logged_in:
+    st.title("🧾 Detector de cuadros + OCR + Autocorrector (TODOS los cuadros)")
 
 uploaded = st.file_uploader("Sube una imagen", type=["png", "jpg", "jpeg"])
 
